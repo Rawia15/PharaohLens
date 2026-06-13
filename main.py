@@ -276,13 +276,15 @@ def build_documents(language: str = "en"):
 # =============================
 # 🔢 Gemini Embeddings
 # =============================
+EMBEDDING_MODEL = "models/embedding-001"  # compatible with google-generativeai v1beta
+
 def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
-    """Embed texts using Gemini text-embedding-004 in batches."""
+    """Embed texts using Gemini embedding-001 in batches."""
     all_embeddings = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         result = genai.embed_content(
-            model="models/text-embedding-004",
+            model=EMBEDDING_MODEL,
             content=batch,
             task_type="retrieval_document",
         )
@@ -294,7 +296,7 @@ def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
 def embed_query(text: str) -> List[float]:
     """Embed a single query for retrieval."""
     result = genai.embed_content(
-        model="models/text-embedding-004",
+        model=EMBEDDING_MODEL,
         content=text,
         task_type="retrieval_query",
     )
