@@ -403,7 +403,6 @@ def build_engine(language: str = "en") -> dict:
 
     return {
         "collection": collection,
-        "llm":        llm,
         "language":   language,
     }
 
@@ -570,7 +569,6 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
 # =============================
 def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     collection = engine["collection"]
-    llm        = engine["llm"]
     language   = engine["language"]
 
     # 1. Retrieve relevant nodes
