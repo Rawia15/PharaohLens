@@ -302,17 +302,22 @@ def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
                 for t in batch
             ]
         }
-        # Retry up to 5 times on rate limit
-        for attempt in range(5):
+        # Retry up to 8 times on rate limit with exponential backoff
+        for attempt in range(8):
             resp = requests.post(GEMINI_BATCH_EMBED_URL, params=params, headers=headers, json=body)
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1)  # 10s, 20s, 30s, 40s, 50s
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s ...
                 print(f"  ⏳ Rate limit hit, waiting {wait}s...")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
             break
-        for emb in resp.json()["embeddings"]:
+
+        data = resp.json()
+        if "embeddings" not in data:
+            print(f"  ⚠️ Unexpected response: {str(data)[:300]}")
+            raise ValueError(f"No embeddings in response: {data}")
+        for emb in data["embeddings"]:
             all_embeddings.append(emb["values"])
         print(f"  📦 Embedded {min(i + batch_size, len(texts))}/{len(texts)}")
         time.sleep(3)  # 3s between batches to stay within free tier
