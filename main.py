@@ -276,7 +276,7 @@ def build_documents(language: str = "en"):
 # =============================
 # 🔢 Gemini Embeddings
 # =============================
-EMBEDDING_MODEL = "models/embedding-001"  # compatible with google-generativeai v1beta
+EMBEDDING_MODEL = "models/text-embedding-004"
 
 def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
     """Embed texts using Gemini embedding-001 in batches."""
