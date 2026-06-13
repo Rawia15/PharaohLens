@@ -539,18 +539,31 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
 
     contents = []
 
-    # Add history turns
+    # Add history turns — Gemini requires strict user/model alternation
+    last_role = None
     for turn in (history or []):
+        role = turn.get("role", "user")  # already "user" or "model"
+        msg  = turn.get("content", "").strip()
+        if not msg:
+            continue
+        # Skip consecutive turns with the same role to avoid 400 errors
+        if role == last_role:
+            continue
         contents.append({
-            "role": turn["role"],
-            "parts": [{"text": turn["content"]}]
+            "role": role,
+            "parts": [{"text": msg}]
         })
+        last_role = role
 
-    # Add current user message
-    contents.append({
-        "role": "user",
-        "parts": [{"text": prompt}]
-    })
+    # Ensure the last history turn is not "user" before we add our user message
+    # (if it is, merge them to avoid consecutive user turns)
+    if contents and contents[-1]["role"] == "user":
+        contents[-1]["parts"][0]["text"] += "\n" + prompt
+    else:
+        contents.append({
+            "role": "user",
+            "parts": [{"text": prompt}]
+        })
 
     body = {
         "contents": contents,
@@ -561,6 +574,8 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
     resp = requests.post(GEMINI_CHAT_URL, params=params, headers=headers, json=body)
+    if not resp.ok:
+        print(f"❌ Gemini error {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
