@@ -276,12 +276,12 @@ def build_documents(language: str = "en"):
 # 🔢 Gemini Embeddings
 # =============================
 GEMINI_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1/models/"
-    "text-embedding-004:embedContent"
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-embedding-001:embedContent"
 )
 GEMINI_BATCH_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1/models/"
-    "text-embedding-004:batchEmbedContents"
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-embedding-001:batchEmbedContents"
 )
 
 def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
@@ -295,7 +295,7 @@ def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
         body  = {
             "requests": [
                 {
-                    "model": "models/text-embedding-004",
+                    "model": "models/gemini-embedding-001",
                     "content": {"parts": [{"text": t}]},
                     "taskType": "RETRIEVAL_DOCUMENT",
                 }
