@@ -284,43 +284,33 @@ GEMINI_BATCH_EMBED_URL = (
     "gemini-embedding-001:batchEmbedContents"
 )
 
+def embed_single(text: str, params: dict, headers: dict) -> List[float]:
+    """Embed a single text with retry on rate limit."""
+    body = {"content": {"parts": [{"text": text}]}, "taskType": "RETRIEVAL_DOCUMENT"}
+    for attempt in range(10):
+        resp = requests.post(GEMINI_EMBED_URL, params=params, headers=headers, json=body)
+        if resp.status_code == 429:
+            wait = 12 * (attempt + 1)
+            print(f"  ⏳ Rate limit, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()["embedding"]["values"]
+    raise Exception("Embedding failed after 10 retries")
+
 def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
-    """Embed texts using Gemini REST API in batches with retry on rate limit."""
+    """Embed texts one by one to avoid batch rate limits."""
     all_embeddings = []
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
+    total   = len(texts)
 
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        body  = {
-            "requests": [
-                {
-                    "model": "models/gemini-embedding-001",
-                    "content": {"parts": [{"text": t}]},
-                    "taskType": "RETRIEVAL_DOCUMENT",
-                }
-                for t in batch
-            ]
-        }
-        # Retry up to 8 times on rate limit with exponential backoff
-        for attempt in range(8):
-            resp = requests.post(GEMINI_BATCH_EMBED_URL, params=params, headers=headers, json=body)
-            if resp.status_code == 429:
-                wait = 15 * (attempt + 1)  # 15s, 30s, 45s ...
-                print(f"  ⏳ Rate limit hit, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            break
-
-        data = resp.json()
-        if "embeddings" not in data:
-            print(f"  ⚠️ Unexpected response: {str(data)[:300]}")
-            raise ValueError(f"No embeddings in response: {data}")
-        for emb in data["embeddings"]:
-            all_embeddings.append(emb["values"])
-        print(f"  📦 Embedded {min(i + batch_size, len(texts))}/{len(texts)}")
-        time.sleep(3)  # 3s between batches to stay within free tier
+    for i, text in enumerate(texts):
+        emb = embed_single(text, params, headers)
+        all_embeddings.append(emb)
+        if (i + 1) % 10 == 0 or (i + 1) == total:
+            print(f"  📦 Embedded {i + 1}/{total}")
+        time.sleep(1.5)  # 1.5s per doc = ~40 RPM, safely under free tier limit
     return all_embeddings
 
 def embed_query(text: str) -> List[float]:
@@ -372,6 +362,20 @@ def expand_query(message: str) -> str:
 # =============================
 # 🧠 Engine Factory (in-memory Chroma)
 # =============================
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
+    """Split text into overlapping word-based chunks for better retrieval."""
+    words  = text.split()
+    chunks = []
+    start  = 0
+    while start < len(words):
+        end   = min(start + chunk_size, len(words))
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        if end == len(words):
+            break
+        start += chunk_size - overlap  # overlap between chunks
+    return chunks
+
 def build_engine(language: str = "en") -> dict:
     print(f"🔄 Building in-memory engine for language: {language}...")
 
@@ -384,27 +388,32 @@ def build_engine(language: str = "en") -> dict:
 
     docs = build_documents(language)
 
-    # Embed in batches and insert into Chroma
-    texts     = [d["text"]     for d in docs]
-    metadatas = [d["metadata"] for d in docs]
-    ids       = [d["id"]       for d in docs]
+    # ── Chunk each document into overlapping pieces ───────────────────────────
+    chunked_texts     = []
+    chunked_metadatas = []
+    chunked_ids       = []
 
-    print(f"🔢 Embedding {len(texts)} documents via Gemini API...")
-    embeddings = embed_texts(texts)
+    for doc in docs:
+        chunks = chunk_text(doc["text"])
+        for j, chunk in enumerate(chunks):
+            chunked_texts.append(chunk)
+            chunked_metadatas.append(doc["metadata"])
+            chunked_ids.append(f"{doc['id']}_chunk{j}")
+
+    print(f"🔢 Embedding {len(chunked_texts)} chunks ({len(docs)} docs) via Gemini API...")
+    embeddings = embed_texts(chunked_texts)
 
     collection.add(
-        ids=ids,
+        ids=chunked_ids,
         embeddings=embeddings,
-        documents=texts,
-        metadatas=metadatas,
+        documents=chunked_texts,
+        metadatas=chunked_metadatas,
     )
-    print(f"✅ {len(docs)} documents indexed in Chroma ({language})")
+    print(f"✅ {len(chunked_texts)} chunks indexed in Chroma ({language})")
 
     # Free memory before building next language
-    del docs, texts, metadatas, ids, embeddings
+    del docs, chunked_texts, chunked_metadatas, chunked_ids, embeddings
     gc.collect()
-
-    # LLM called via gemini_generate() REST helper
 
     return {
         "collection": collection,
