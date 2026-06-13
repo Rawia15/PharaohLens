@@ -284,8 +284,8 @@ GEMINI_BATCH_EMBED_URL = (
     "gemini-embedding-001:batchEmbedContents"
 )
 
-def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
-    """Embed texts using Gemini REST API in batches."""
+def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+    """Embed texts using Gemini REST API in batches with retry on rate limit."""
     all_embeddings = []
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
@@ -302,12 +302,20 @@ def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
                 for t in batch
             ]
         }
-        resp = requests.post(GEMINI_BATCH_EMBED_URL, params=params, headers=headers, json=body)
-        resp.raise_for_status()
+        # Retry up to 5 times on rate limit
+        for attempt in range(5):
+            resp = requests.post(GEMINI_BATCH_EMBED_URL, params=params, headers=headers, json=body)
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)  # 10s, 20s, 30s, 40s, 50s
+                print(f"  ⏳ Rate limit hit, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
         for emb in resp.json()["embeddings"]:
             all_embeddings.append(emb["values"])
         print(f"  📦 Embedded {min(i + batch_size, len(texts))}/{len(texts)}")
-        time.sleep(0.5)  # stay within free-tier rate limits
+        time.sleep(3)  # 3s between batches to stay within free tier
     return all_embeddings
 
 def embed_query(text: str) -> List[float]:
