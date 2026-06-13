@@ -528,7 +528,7 @@ def build_context_block(nodes: list, language: str) -> str:
 # 🤖 Gemini LLM via REST
 # =============================
 GEMINI_CHAT_URL = (
-    "https://generativelanguage.googleapis.com/v1/models/"
+    "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-1.5-flash:generateContent"
 )
 
