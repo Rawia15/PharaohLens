@@ -13,8 +13,7 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from supabase import create_client
 
-import google.generativeai as genai
-from google.generativeai import GenerativeModel
+import requests
 
 # =============================
 # 🔐 ENV & CLIENTS
@@ -29,7 +28,7 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
         "Make sure SUPABASE_URL, SUPABASE_KEY, and GEMINI_API_KEY are set."
     )
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Gemini via REST API — no SDK needed
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================
@@ -276,31 +275,52 @@ def build_documents(language: str = "en"):
 # =============================
 # 🔢 Gemini Embeddings
 # =============================
-EMBEDDING_MODEL = "models/text-embedding-004"
+GEMINI_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1/models/"
+    "text-embedding-004:embedContent"
+)
+GEMINI_BATCH_EMBED_URL = (
+    "https://generativelanguage.googleapis.com/v1/models/"
+    "text-embedding-004:batchEmbedContents"
+)
 
 def embed_texts(texts: List[str], batch_size: int = 20) -> List[List[float]]:
-    """Embed texts using Gemini embedding-001 in batches."""
+    """Embed texts using Gemini REST API in batches."""
     all_embeddings = []
+    headers = {"Content-Type": "application/json"}
+    params  = {"key": GEMINI_API_KEY}
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=batch,
-            task_type="retrieval_document",
-        )
-        all_embeddings.extend(result["embedding"])
+        body  = {
+            "requests": [
+                {
+                    "model": "models/text-embedding-004",
+                    "content": {"parts": [{"text": t}]},
+                    "taskType": "RETRIEVAL_DOCUMENT",
+                }
+                for t in batch
+            ]
+        }
+        resp = requests.post(GEMINI_BATCH_EMBED_URL, params=params, headers=headers, json=body)
+        resp.raise_for_status()
+        for emb in resp.json()["embeddings"]:
+            all_embeddings.append(emb["values"])
         print(f"  📦 Embedded {min(i + batch_size, len(texts))}/{len(texts)}")
         time.sleep(0.5)  # stay within free-tier rate limits
     return all_embeddings
 
 def embed_query(text: str) -> List[float]:
-    """Embed a single query for retrieval."""
-    result = genai.embed_content(
-        model=EMBEDDING_MODEL,
-        content=text,
-        task_type="retrieval_query",
-    )
-    return result["embedding"]
+    """Embed a single query using Gemini REST API."""
+    headers = {"Content-Type": "application/json"}
+    params  = {"key": GEMINI_API_KEY}
+    body    = {
+        "content": {"parts": [{"text": text}]},
+        "taskType": "RETRIEVAL_QUERY",
+    }
+    resp = requests.post(GEMINI_EMBED_URL, params=params, headers=headers, json=body)
+    resp.raise_for_status()
+    return resp.json()["embedding"]["values"]
 
 # =============================
 # 🔍 Query Expansion
@@ -371,7 +391,7 @@ def build_engine(language: str = "en") -> dict:
     del docs, texts, metadatas, ids, embeddings
     gc.collect()
 
-    llm = GenerativeModel("gemini-1.5-flash")
+    # LLM called via gemini_generate() REST helper
 
     return {
         "collection": collection,
@@ -498,6 +518,46 @@ def build_context_block(nodes: list, language: str) -> str:
     )
 
 # =============================
+# 🤖 Gemini LLM via REST
+# =============================
+GEMINI_CHAT_URL = (
+    "https://generativelanguage.googleapis.com/v1/models/"
+    "gemini-1.5-flash:generateContent"
+)
+
+def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
+    """Call Gemini 1.5 Flash via REST API."""
+    headers = {"Content-Type": "application/json"}
+    params  = {"key": GEMINI_API_KEY}
+
+    contents = []
+
+    # Add history turns
+    for turn in (history or []):
+        contents.append({
+            "role": turn["role"],
+            "parts": [{"text": turn["content"]}]
+        })
+
+    # Add current user message
+    contents.append({
+        "role": "user",
+        "parts": [{"text": prompt}]
+    })
+
+    body = {
+        "contents": contents,
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+
+    resp = requests.post(GEMINI_CHAT_URL, params=params, headers=headers, json=body)
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+# =============================
 # 💬 Chat Logic
 # =============================
 def run_chat(engine: dict, message: str, history: List[dict]) -> str:
@@ -518,32 +578,25 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
         else message
     )
 
-    # 4. Build conversation for Gemini
-    system_prompt = get_system_prompt(language)
-
-    # Cap history at last 6 turns to save tokens
+    # 4. Call Gemini via REST
+    system_prompt  = get_system_prompt(language)
     recent_history = history[-12:] if len(history) > 12 else history
 
-    # Gemini uses a list of Content objects
     gemini_history = []
     for turn in recent_history:
-        role    = turn.get("role", "user")
-        content = turn.get("content", "")
-        if role in ("user", "assistant") and content:
-            gemini_role = "user" if role == "user" else "model"
-            gemini_history.append({"role": gemini_role, "parts": [content]})
+        r    = turn.get("role", "user")
+        msg  = turn.get("content", "")
+        if r in ("user", "assistant") and msg:
+            gemini_history.append({
+                "role":    "user" if r == "user" else "model",
+                "content": msg,
+            })
 
-    # Start chat with history
-    chat = llm.start_chat(history=gemini_history)
-
-    # Inject system prompt into first user turn if no history
-    if not gemini_history:
-        full_message = f"{system_prompt}\n\n{augmented}"
-    else:
-        full_message = augmented
-
-    response = chat.send_message(full_message)
-    answer   = response.text
+    answer = gemini_generate(
+        prompt=augmented,
+        system=system_prompt,
+        history=gemini_history,
+    )
 
     # If Horus fell back to historian knowledge, attach the source he cited
     fallback_markers = ["📜 Based on historical records", "📜 استناداً إلى المصادر التاريخية"]
@@ -648,9 +701,7 @@ Example format:
   }}
 ]"""
 
-        llm      = GenerativeModel("gemini-1.5-flash")
-        response = llm.generate_content(quiz_prompt)
-        raw      = response.text.strip().replace("```json", "").replace("```", "").strip()
+        raw = gemini_generate(quiz_prompt).strip().replace("```json", "").replace("```", "").strip()
         quiz     = json_lib.loads(raw)
         return {"quiz": quiz}
 
