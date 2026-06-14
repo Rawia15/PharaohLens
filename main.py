@@ -2,10 +2,13 @@
 # 🧠 Imports
 # =============================
 import os
+import re
 import gc
 import json as json_lib
 import threading
 import time
+from datetime import datetime, timezone
+from urllib.parse import quote_plus
 from typing import List
 
 import chromadb
@@ -38,26 +41,31 @@ TRUSTED_SOURCES = [
     {
         "name": "Ancient Egypt Research Associates (AERA)",
         "url":  "https://aeraweb.org",
+        "search_url": "https://aeraweb.org/?s={query}",
         "desc": "Fieldwork and research at Giza by leading Egyptologists",
     },
     {
         "name": "World History Encyclopedia",
         "url":  "https://worldhistory.org",
+        "search_url": "https://www.worldhistory.org/search/?q={query}",
         "desc": "Peer-reviewed ancient history articles",
     },
     {
         "name": "Britannica",
         "url":  "https://britannica.com",
+        "search_url": "https://www.britannica.com/search?query={query}",
         "desc": "Encyclopedia articles on Ancient Egypt",
     },
     {
         "name": "The British Museum",
         "url":  "https://britishmuseum.org",
+        "search_url": "https://www.britishmuseum.org/collection/search?keyword={query}",
         "desc": "One of the world's largest Egyptian artifact collections",
     },
     {
         "name": "The Metropolitan Museum of Art",
         "url":  "https://metmuseum.org",
+        "search_url": "https://www.metmuseum.org/art/collection/search?q={query}",
         "desc": "Extensive Egyptian art and artifact database",
     },
 ]
@@ -84,16 +92,107 @@ def detect_cited_source(answer: str) -> dict | None:
     return None
 
 # =============================
+# 🚦 Usage Limits (non-VIP users)
+# =============================
+DAILY_MESSAGE_LIMIT = 10        # non-VIP signed-in users
+USAGE_TABLE         = "chat_usage"
+
+LIMIT_REACHED_MESSAGE = {
+    "en": (
+        "📜 You've reached your free daily limit of questions for Horus. "
+        "Come back tomorrow for more wisdom from Ancient Egypt — "
+        "or upgrade to VIP for unlimited access! 🏺✨"
+    ),
+    "ar": (
+        "📜 لقد وصلت إلى الحد اليومي المجاني من الأسئلة لحورس. "
+        "عد غداً لمزيد من حكمة مصر القديمة — "
+        "أو قم بالترقية إلى VIP للوصول غير المحدود! 🏺✨"
+    ),
+}
+
+SERVICE_BUSY_MESSAGE = {
+    "en": (
+        "📜 Horus is taking a short break right now due to high demand. "
+        "Please try again in a few minutes. 🙏"
+    ),
+    "ar": (
+        "📜 حورس يأخذ استراحة قصيرة الآن بسبب الطلب الكبير. "
+        "حاول مرة أخرى بعد بضع دقائق. 🙏"
+    ),
+}
+
+def is_vip_user(user_id: str) -> bool:
+    """Check if a user has VIP status in the users table."""
+    if not user_id:
+        return False
+    try:
+        result = supabase.table("users").select("is_vip").eq("id", user_id).execute()
+        if result.data and len(result.data) > 0:
+            return bool(result.data[0].get("is_vip", False))
+    except Exception as e:
+        print(f"⚠️ Could not check VIP status: {e}")
+    return False
+
+def get_today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def get_today_usage(user_id: str) -> int:
+    """Get today's message count for a user. Returns 0 if no record."""
+    try:
+        result = (
+            supabase.table(USAGE_TABLE)
+            .select("message_count")
+            .eq("user_id", user_id)
+            .eq("usage_date", get_today_utc())
+            .execute()
+        )
+        if result.data and len(result.data) > 0:
+            return result.data[0].get("message_count", 0)
+    except Exception as e:
+        print(f"⚠️ Could not read usage: {e}")
+    return 0
+
+def increment_usage(user_id: str):
+    """Atomically increment today's message count via Supabase RPC."""
+    try:
+        supabase.rpc("increment_chat_usage", {
+            "p_user_id": user_id,
+            "p_date":    get_today_utc()
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ Could not update usage: {e}")
+
+def check_usage_limit(user_id: str, language: str) -> str | None:
+    """
+    Returns a limit-reached message if the user is over their daily limit,
+    or None if they're allowed to proceed.
+    """
+    # No user_id → treat as guest with a small limit, identified loosely
+    if not user_id:
+        return None  # guests are limited client-side / not tracked server-side
+
+    if is_vip_user(user_id):
+        return None  # VIPs have no limit
+
+    usage = get_today_usage(user_id)
+    if usage >= DAILY_MESSAGE_LIMIT:
+        return LIMIT_REACHED_MESSAGE.get(language, LIMIT_REACHED_MESSAGE["en"])
+
+    return None
+
+# =============================
 # 📝 Request Models
 # =============================
 class ChatRequest(BaseModel):
     message: str
     history: List[dict]
     language: str = "en"
+    user_id: str = ""  # empty string = guest user
 
 class QuizRequest(BaseModel):
     chat_history: List[str]
     language: str = "en"
+    user_id: str = ""  # empty string = guest user
 
 # =============================
 # 📥 Data Fetching
@@ -545,6 +644,10 @@ def get_system_prompt(language: str) -> str:
             "بريتانيكا (britannica.com)، "
             "المتحف البريطاني (britishmuseum.org)، "
             "متحف متروبوليتان للفنون (metmuseum.org).\n"
+            "   - في نهاية ردك، أضف سطراً جديداً يحتوي فقط على: "
+            "[TOPIC: كلمة أو كلمتين بالإنجليزية تمثلان الموضوع الرئيسي] "
+            "— مثال: [TOPIC: Imhotep] أو [TOPIC: Abu Simbel]. "
+            "هذا السطر لن يظهر للمستخدم، استخدم دائماً كلمات إنجليزية للموضوع.\n"
             "3. لا تختلق معلومات أبداً. إذا لم تعرف، قل: 'هذه المعلومة غير متاحة في سجلاتنا.'\n"
             "4. نطاق عملك: مصر القديمة فقط — فراعنة، آلهة، معالم، أسرات، آثار.\n"
             "5. للأسئلة خارج النطاق: قل 'أنا متخصص في مصر القديمة فقط. هل تريد استكشاف فرعون أو معلم أو حضارة؟'\n"
@@ -571,6 +674,10 @@ def get_system_prompt(language: str) -> str:
         "Britannica (britannica.com), "
         "The British Museum (britishmuseum.org), "
         "The Metropolitan Museum of Art (metmuseum.org).\n"
+        "   - At the very end of your reply, add a new line containing ONLY: "
+        "[TOPIC: 1-2 word topic name in English] — e.g. [TOPIC: Imhotep] or "
+        "[TOPIC: Abu Simbel]. This line will be hidden from the user, "
+        "always use English words for the topic.\n"
         "3. Never fabricate. If genuinely unknown, say: 'This detail isn't in our records.'\n"
         "4. Scope: Ancient Egypt only — pharaohs, gods, monuments, dynasties, artifacts.\n"
         "5. Off-topic questions: say 'I can only guide you through Ancient Egypt! "
@@ -713,12 +820,20 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     is_fallback = any(marker in answer for marker in fallback_markers)
 
     if is_fallback:
+        # Extract the hidden [TOPIC: ...] tag if present, and remove it from the visible answer
+        topic_match = re.search(r"\[TOPIC:\s*([^\]]+)\]", answer)
+        topic = topic_match.group(1).strip() if topic_match else None
+        answer = re.sub(r"\n*\[TOPIC:\s*[^\]]+\]\s*$", "", answer).strip()
+
         source = detect_cited_source(answer)
         if source:
+            search_term = topic if topic else message.strip()
+            search_query = quote_plus(search_term)
+            link_url = source["search_url"].format(query=search_query)
             if language == "ar":
-                answer += f"\n\n📌 المصدر: [{source['name']}]({source['url']})"
+                answer += f"\n\n🔍 بحث عن \"{search_term}\" في: [{source['name']}]({link_url})"
             else:
-                answer += f"\n\n📌 Source: [{source['name']}]({source['url']})"
+                answer += f"\n\n🔍 Search \"{search_term}\" on: [{source['name']}]({link_url})"
 
     return answer
 
@@ -769,16 +884,43 @@ def home():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    # 1. Check daily usage limit (non-VIP users)
+    limit_message = check_usage_limit(request.user_id, request.language)
+    if limit_message:
+        return {"answer": limit_message}
+
     try:
         engine = get_engine(request.language)
         answer = run_chat(engine, request.message, request.history)
+
+        # 2. Count this message toward the user's daily usage
+        if request.user_id:
+            increment_usage(request.user_id)
+
         return {"answer": answer}
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        print(f"❌ Gemini HTTP error: {status} — {e}")
+        if status in (429, 503, 500):
+            return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
+        return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
+
     except Exception as e:
         print(f"❌ Chat error: {e}")
-        return {"error": str(e)}
+        return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
 
 @app.post("/generate-quiz")
 def generate_quiz(request: QuizRequest):
+    # 1. Check daily usage limit (non-VIP users) — quiz also uses Gemini quota
+    limit_message = check_usage_limit(request.user_id, request.language)
+    if limit_message:
+        return {"quiz": [{
+            "question": limit_message,
+            "options": ["OK", "OK", "OK", "OK"],
+            "correct_answer": "OK",
+        }]}
+
     try:
         history_text = (
             "\n".join(request.chat_history)
@@ -811,12 +953,31 @@ Example format:
   }}
 ]"""
 
-        raw = gemini_generate(quiz_prompt).strip().replace("```json", "").replace("```", "").strip()
-        quiz     = json_lib.loads(raw)
+        raw  = gemini_generate(quiz_prompt).strip().replace("```json", "").replace("```", "").strip()
+        quiz = json_lib.loads(raw)
+
+        # 2. Count this quiz generation toward the user's daily usage
+        if request.user_id:
+            increment_usage(request.user_id)
+
         return {"quiz": quiz}
 
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        print(f"❌ Gemini HTTP error (quiz): {status} — {e}")
+        return {"quiz": [{
+            "question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]),
+            "options": ["OK", "OK", "OK", "OK"],
+            "correct_answer": "OK",
+        }]}
+
     except Exception as e:
-        return {"error": f"Quiz Error: {str(e)}"}
+        print(f"❌ Quiz error: {e}")
+        return {"quiz": [{
+            "question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]),
+            "options": ["OK", "OK", "OK", "OK"],
+            "correct_answer": "OK",
+        }]}
 
 @app.api_route("/rebuild-index", methods=["GET", "POST"])
 def rebuild_index(background_tasks: BackgroundTasks):
