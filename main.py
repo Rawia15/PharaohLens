@@ -285,13 +285,18 @@ GEMINI_BATCH_EMBED_URL = (
 )
 
 def embed_single(text: str, params: dict, headers: dict) -> List[float]:
-    """Embed a single text with retry on rate limit."""
+    """Embed a single text with retry on rate limit or server errors."""
     body = {"content": {"parts": [{"text": text}]}, "taskType": "RETRIEVAL_DOCUMENT"}
     for attempt in range(10):
         resp = requests.post(GEMINI_EMBED_URL, params=params, headers=headers, json=body)
         if resp.status_code == 429:
             wait = 12 * (attempt + 1)
             print(f"  ⏳ Rate limit, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if resp.status_code in (500, 503):
+            wait = 5 * (attempt + 1)
+            print(f"  ⏳ Gemini server error {resp.status_code}, waiting {wait}s...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
