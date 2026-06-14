@@ -376,6 +376,35 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
         start += chunk_size - overlap  # overlap between chunks
     return chunks
 
+# =============================
+# 💾 Supabase Embedding Cache
+# =============================
+CACHE_TABLE = "embeddings_cache"
+
+def save_cache_to_supabase(language: str, rows: list):
+    """Save chunks + embeddings to Supabase for future restarts."""
+    try:
+        # Delete old cache for this language first
+        supabase.table(CACHE_TABLE).delete().eq("language", language).execute()
+        # Insert in batches of 50 to avoid request size limits
+        for i in range(0, len(rows), 50):
+            supabase.table(CACHE_TABLE).insert(rows[i:i+50]).execute()
+        print(f"💾 Saved {len(rows)} chunks to Supabase cache ({language})")
+    except Exception as e:
+        print(f"⚠️ Could not save cache: {e}")
+
+def load_cache_from_supabase(language: str):
+    """Load cached chunks + embeddings from Supabase. Returns list or None."""
+    try:
+        result = supabase.table(CACHE_TABLE).select("*").eq("language", language).execute()
+        if result.data and len(result.data) > 0:
+            print(f"⚡ Loaded {len(result.data)} cached chunks from Supabase ({language})")
+            return result.data
+        return None
+    except Exception as e:
+        print(f"⚠️ Could not load cache: {e}")
+        return None
+
 def build_engine(language: str = "en") -> dict:
     print(f"🔄 Building in-memory engine for language: {language}...")
 
@@ -386,33 +415,67 @@ def build_engine(language: str = "en") -> dict:
         metadata={"hnsw:space": "cosine"},
     )
 
-    docs = build_documents(language)
+    # ── Try loading from Supabase cache first ─────────────────────────────────
+    cached = load_cache_from_supabase(language)
 
-    # ── Chunk each document into overlapping pieces ───────────────────────────
-    chunked_texts     = []
-    chunked_metadatas = []
-    chunked_ids       = []
+    if cached:
+        # Fast path: load from cache — no Gemini API calls needed
+        chunked_ids       = [r["chunk_id"]              for r in cached]
+        chunked_texts     = [r["text"]                  for r in cached]
+        chunked_metadatas = [json_lib.loads(r["metadata"]) for r in cached]
+        embeddings        = [json_lib.loads(r["embedding"]) for r in cached]
 
-    for doc in docs:
-        chunks = chunk_text(doc["text"])
-        for j, chunk in enumerate(chunks):
-            chunked_texts.append(chunk)
-            chunked_metadatas.append(doc["metadata"])
-            chunked_ids.append(f"{doc['id']}_chunk{j}")
+        collection.add(
+            ids=chunked_ids,
+            embeddings=embeddings,
+            documents=chunked_texts,
+            metadatas=chunked_metadatas,
+        )
+        print(f"✅ {len(cached)} chunks loaded from cache into Chroma ({language})")
 
-    print(f"🔢 Embedding {len(chunked_texts)} chunks ({len(docs)} docs) via Gemini API...")
-    embeddings = embed_texts(chunked_texts)
+    else:
+        # Slow path: embed from scratch and save to cache
+        docs = build_documents(language)
 
-    collection.add(
-        ids=chunked_ids,
-        embeddings=embeddings,
-        documents=chunked_texts,
-        metadatas=chunked_metadatas,
-    )
-    print(f"✅ {len(chunked_texts)} chunks indexed in Chroma ({language})")
+        chunked_texts     = []
+        chunked_metadatas = []
+        chunked_ids       = []
 
-    # Free memory before building next language
-    del docs, chunked_texts, chunked_metadatas, chunked_ids, embeddings
+        for doc in docs:
+            chunks = chunk_text(doc["text"])
+            for j, chunk in enumerate(chunks):
+                chunked_texts.append(chunk)
+                chunked_metadatas.append(doc["metadata"])
+                chunked_ids.append(f"{doc['id']}_chunk{j}")
+
+        print(f"🔢 Embedding {len(chunked_texts)} chunks ({len(docs)} docs) via Gemini API...")
+        embeddings = embed_texts(chunked_texts)
+
+        collection.add(
+            ids=chunked_ids,
+            embeddings=embeddings,
+            documents=chunked_texts,
+            metadatas=chunked_metadatas,
+        )
+        print(f"✅ {len(chunked_texts)} chunks indexed in Chroma ({language})")
+
+        # Save to Supabase cache for future restarts
+        cache_rows = [
+            {
+                "chunk_id":  chunked_ids[i],
+                "language":  language,
+                "text":      chunked_texts[i],
+                "metadata":  json_lib.dumps(chunked_metadatas[i]),
+                "embedding": json_lib.dumps(embeddings[i]),
+            }
+            for i in range(len(chunked_ids))
+        ]
+        save_cache_to_supabase(language, cache_rows)
+
+        del docs, cache_rows
+        gc.collect()
+
+    del chunked_texts, chunked_metadatas, chunked_ids, embeddings
     gc.collect()
 
     return {
@@ -756,12 +819,18 @@ def rebuild_index(background_tasks: BackgroundTasks):
 
     def do_rebuild():
         try:
+            # Clear Supabase cache so embeddings are regenerated fresh
+            try:
+                supabase.table(CACHE_TABLE).delete().neq("chunk_id", "").execute()
+                print("🗑️ Supabase embedding cache cleared")
+            except Exception as e:
+                print(f"⚠️ Could not clear cache: {e}")
             build_engines_sequentially()
         finally:
             app.state.rebuilding = False
 
     background_tasks.add_task(do_rebuild)
-    return {"message": "Rebuild started in background.", "status": "rebuilding"}
+    return {"message": "Rebuild started. Cache cleared, re-embedding from scratch.", "status": "rebuilding"}
 
 @app.api_route("/rebuild-status", methods=["GET"])
 def rebuild_status():
