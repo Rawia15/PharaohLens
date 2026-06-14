@@ -410,7 +410,14 @@ def build_engine(language: str = "en") -> dict:
 
     # In-memory Chroma client — no disk, no persistence issues on Railway
     chroma_client = chromadb.Client()
-    collection    = chroma_client.create_collection(
+
+    # Delete existing collection if present (e.g. on rebuild)
+    try:
+        chroma_client.delete_collection(name=f"pharaoh_{language}")
+    except Exception:
+        pass  # collection didn't exist yet — that's fine
+
+    collection = chroma_client.create_collection(
         name=f"pharaoh_{language}",
         metadata={"hnsw:space": "cosine"},
     )
