@@ -66,7 +66,7 @@ TRUSTED_SOURCES = [
     },
     {
         "name": "Egyptian Museum Cairo",
-        "url":  "https://egyptianmuseum.gov.eg",
+        "url":  "https://egyptianmuseumcairo.eg/",
         "desc": "Primary Egyptian government museum — direct artifact source",
     },
     {
