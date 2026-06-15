@@ -94,7 +94,7 @@ def detect_cited_source(answer: str) -> dict | None:
 # =============================
 # 🚦 Usage Limits (non-VIP users)
 # =============================
-DAILY_MESSAGE_LIMIT = 10        # non-VIP signed-in users
+DAILY_MESSAGE_LIMIT = 5        # non-VIP signed-in users
 USAGE_TABLE         = "chat_usage"
 
 LIMIT_REACHED_MESSAGE = {
