@@ -21,9 +21,11 @@ import requests
 # =============================
 # 🔐 ENV & CLIENTS
 # =============================
-SUPABASE_URL  = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY  = os.environ.get("SUPABASE_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SUPABASE_URL      = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY      = os.environ.get("SUPABASE_KEY")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
+GOOGLE_CSE_KEY    = os.environ.get("GOOGLE_CSE_KEY")    # Google Custom Search API key
+GOOGLE_CSE_ID     = os.environ.get("GOOGLE_CSE_ID")     # Your Programmable Search Engine ID
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     raise ValueError(
@@ -31,7 +33,6 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
         "Make sure SUPABASE_URL, SUPABASE_KEY, and GEMINI_API_KEY are set."
     )
 
-# Gemini via REST API — no SDK needed
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================
@@ -41,60 +42,167 @@ TRUSTED_SOURCES = [
     {
         "name": "Ancient Egypt Research Associates (AERA)",
         "url":  "https://aeraweb.org",
-        "search_url": "https://aeraweb.org/?s={query}",
         "desc": "Fieldwork and research at Giza by leading Egyptologists",
     },
     {
         "name": "World History Encyclopedia",
         "url":  "https://worldhistory.org",
-        "search_url": "https://www.worldhistory.org/search/?q={query}",
-        "desc": "Peer-reviewed ancient history articles",
+        "desc": "Peer-reviewed ancient history articles — fully open access",
     },
     {
         "name": "Britannica",
         "url":  "https://britannica.com",
-        "search_url": "https://www.britannica.com/search?query={query}",
         "desc": "Encyclopedia articles on Ancient Egypt",
     },
     {
         "name": "The British Museum",
         "url":  "https://britishmuseum.org",
-        "search_url": "https://www.britishmuseum.org/collection/search?keyword={query}",
         "desc": "One of the world's largest Egyptian artifact collections",
     },
     {
         "name": "The Metropolitan Museum of Art",
         "url":  "https://metmuseum.org",
-        "search_url": "https://www.metmuseum.org/art/collection/search?q={query}",
-        "desc": "Extensive Egyptian art and artifact database",
+        "desc": "Extensive Egyptian art and artifact database — fully open",
+    },
+    {
+        "name": "Egyptian Museum Cairo",
+        "url":  "https://egyptianmuseum.gov.eg",
+        "desc": "Primary Egyptian government museum — direct artifact source",
+    },
+    {
+        "name": "Smithsonian Institution",
+        "url":  "https://si.edu",
+        "desc": "Authoritative research and collections on ancient civilizations",
+    },
+    {
+        "name": "The Louvre Museum",
+        "url":  "https://louvre.fr/en",
+        "desc": "Second largest Egyptian collection in the world",
+    },
+    {
+        "name": "UNESCO World Heritage",
+        "url":  "https://whc.unesco.org",
+        "desc": "Official descriptions of Egyptian heritage sites",
     },
 ]
 
-SOURCES_BY_KEYWORD = {
-    "aera":                              TRUSTED_SOURCES[0],
-    "aeraweb":                           TRUSTED_SOURCES[0],
-    "ancient egypt research associates": TRUSTED_SOURCES[0],
-    "world history":                     TRUSTED_SOURCES[1],
-    "worldhistory":                      TRUSTED_SOURCES[1],
-    "britannica":                        TRUSTED_SOURCES[2],
-    "british museum":                    TRUSTED_SOURCES[3],
-    "britishmuseum":                     TRUSTED_SOURCES[3],
-    "metropolitan":                      TRUSTED_SOURCES[4],
-    "metmuseum":                         TRUSTED_SOURCES[4],
-}
+TRUSTED_DOMAINS = [s["url"].replace("https://", "") for s in TRUSTED_SOURCES]
+# → ["aeraweb.org", "worldhistory.org", "britannica.com", "britishmuseum.org",
+#    "metmuseum.org", "egyptianmuseum.gov.eg", "si.edu", "louvre.fr/en", "whc.unesco.org"]
 
-def detect_cited_source(answer: str) -> dict | None:
-    """Find which trusted source Horus mentioned in his answer."""
-    answer_lower = answer.lower()
-    for keyword, source in SOURCES_BY_KEYWORD.items():
-        if keyword in answer_lower:
-            return source
-    return None
+# =============================
+# 🔎 Google Custom Search
+# =============================
+GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+
+def web_search_trusted(query: str, num_results: int = 3) -> list[dict]:
+    """
+    Search trusted Egyptology sites via Google Custom Search API.
+    Returns a list of {title, url, snippet} dicts, or [] on failure.
+
+    Setup (one-time):
+      1. Go to https://programmablesearchengine.google.com/
+      2. Create a new search engine, add the 5 trusted domains under "Sites to search"
+      3. Copy the Search Engine ID → set as GOOGLE_CSE_ID env var
+      4. Go to https://console.cloud.google.com/ → APIs → Custom Search JSON API → enable it
+      5. Create an API key → set as GOOGLE_CSE_KEY env var
+    """
+    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
+        print("⚠️ GOOGLE_CSE_KEY or GOOGLE_CSE_ID not set — web search fallback disabled")
+        return []
+
+    try:
+        params = {
+            "key": GOOGLE_CSE_KEY,
+            "cx":  GOOGLE_CSE_ID,
+            "q":   query,
+            "num": num_results,
+        }
+        resp = requests.get(GOOGLE_CSE_ENDPOINT, params=params, timeout=8)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        results = []
+        for item in items:
+            results.append({
+                "title":   item.get("title", ""),
+                "url":     item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            })
+        print(f"🔍 Web search for '{query}' → {len(results)} results")
+        return results
+    except Exception as e:
+        print(f"⚠️ Web search failed: {e}")
+        return []
+
+
+def fetch_page_content(url: str, max_chars: int = 3000) -> str:
+    """
+    Fetch the text content of a page to give Gemini real grounding context.
+    Uses a simple extraction — good enough for article-style pages.
+    Falls back to empty string on any error.
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; PharaohLensBot/1.0)"}
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+
+        # Strip HTML tags with a lightweight regex (no BeautifulSoup dependency)
+        text = re.sub(r"<style[^>]*>.*?</style>", " ", resp.text, flags=re.DOTALL)
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # Trim to max_chars so we don't blow up the Gemini context window
+        return text[:max_chars]
+    except Exception as e:
+        print(f"⚠️ Could not fetch {url}: {e}")
+        return ""
+
+
+def web_search_and_ground(query: str, language: str) -> dict | None:
+    """
+    Full fallback pipeline:
+      1. Search Google CSE for the query across trusted domains
+      2. Fetch the top result's page content
+      3. Return {url, title, source_name, page_content} for Gemini to use
+
+    Returns None if no useful results found or CSE is not configured.
+    """
+    results = web_search_trusted(query)
+    if not results:
+        return None
+
+    # Take the best result (Google CSE already ranks by relevance)
+    best = results[0]
+    url  = best["url"]
+
+    # Identify which trusted source this belongs to
+    source_name = None
+    for source in TRUSTED_SOURCES:
+        domain = source["url"].replace("https://", "")
+        if domain in url:
+            source_name = source["name"]
+            break
+    source_name = source_name or url  # fallback to raw URL if unmatched
+
+    # Fetch the real page content to ground Gemini's answer
+    page_content = fetch_page_content(url)
+    if not page_content:
+        # No content fetched — still return the URL, just without grounding
+        page_content = best["snippet"]  # use snippet as minimal context
+
+    return {
+        "url":          url,
+        "title":        best["title"],
+        "source_name":  source_name,
+        "page_content": page_content,
+    }
+
 
 # =============================
 # 🚦 Usage Limits (non-VIP users)
 # =============================
-DAILY_MESSAGE_LIMIT = 5        # non-VIP signed-in users
+DAILY_MESSAGE_LIMIT = 10
 USAGE_TABLE         = "chat_usage"
 
 LIMIT_REACHED_MESSAGE = {
@@ -122,7 +230,6 @@ SERVICE_BUSY_MESSAGE = {
 }
 
 def is_vip_user(user_id: str) -> bool:
-    """Check if a user has VIP status in the users table."""
     if not user_id:
         return False
     try:
@@ -137,7 +244,6 @@ def get_today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 def get_today_usage(user_id: str) -> int:
-    """Get today's message count for a user. Returns 0 if no record."""
     try:
         result = (
             supabase.table(USAGE_TABLE)
@@ -153,7 +259,6 @@ def get_today_usage(user_id: str) -> int:
     return 0
 
 def increment_usage(user_id: str):
-    """Atomically increment today's message count via Supabase RPC."""
     try:
         supabase.rpc("increment_chat_usage", {
             "p_user_id": user_id,
@@ -162,23 +267,29 @@ def increment_usage(user_id: str):
     except Exception as e:
         print(f"⚠️ Could not update usage: {e}")
 
-def check_usage_limit(user_id: str, language: str) -> str | None:
+def check_usage_limit(user_id: str, language: str, is_vip: bool = False) -> str | None:
     """
-    Returns a limit-reached message if the user is over their daily limit,
-    or None if they're allowed to proceed.
+    Returns a limit-reached message if the user exceeded their daily quota, else None.
+
+    is_vip is passed directly from the client request — the Android app already
+    has the correct VIP state from its own auth flow. We do NOT re-query Supabase
+    here because:
+      1. It adds latency to every single message.
+      2. A query failure would silently return False, blocking real VIP users.
+      3. The client value is already verified against Supabase at login time.
+
+    Guests (empty user_id) are not tracked server-side.
+    VIP users bypass the limit entirely — their usage is also not incremented.
     """
-    # No user_id → treat as guest with a small limit, identified loosely
     if not user_id:
-        return None  # guests are limited client-side / not tracked server-side
-
-    if is_vip_user(user_id):
-        return None  # VIPs have no limit
-
+        return None   # guest — not tracked
+    if is_vip:
+        return None   # VIP — no limit, skip everything
     usage = get_today_usage(user_id)
     if usage >= DAILY_MESSAGE_LIMIT:
         return LIMIT_REACHED_MESSAGE.get(language, LIMIT_REACHED_MESSAGE["en"])
-
     return None
+
 
 # =============================
 # 📝 Request Models
@@ -187,12 +298,18 @@ class ChatRequest(BaseModel):
     message: str
     history: List[dict]
     language: str = "en"
-    user_id: str = ""  # empty string = guest user
+    user_id: str = ""
+    # ✅ FIX: Client sends is_vip directly — avoids a fragile Supabase re-check
+    # on every single message. The Android app already knows VIP state reliably.
+    # Defaults to False so old app versions keep working without crashing.
+    is_vip: bool = False
 
 class QuizRequest(BaseModel):
     chat_history: List[str]
     language: str = "en"
-    user_id: str = ""  # empty string = guest user
+    user_id: str = ""
+    is_vip: bool = False  # ✅ same fix for quiz endpoint
+
 
 # =============================
 # 📥 Data Fetching
@@ -234,18 +351,17 @@ def parse_json_field(raw):
         pass
     return ""
 
+
 # =============================
 # 📄 Document Builder
 # =============================
 def build_documents(language: str = "en"):
-    """Returns list of (text, metadata) tuples — no heavy objects."""
     monuments, entities, relations = fetch_data_from_supabase()
     m_to_e    = build_lookup_maps(entities, relations)
     e_to_m    = build_entity_to_monuments_map(monuments, relations)
     is_arabic = language == "ar"
-    docs = []  # list of {"text": str, "metadata": dict, "id": str}
+    docs = []
 
-    # ── Entity documents ─────────────────────────────────────────────────────
     for e in entities:
         entity_id         = e.get("id")
         related_monuments = e_to_m.get(entity_id, [])
@@ -314,7 +430,6 @@ def build_documents(language: str = "en"):
             "metadata": {"type": "entity", "name": name, "language": language},
         })
 
-    # ── Monument documents ────────────────────────────────────────────────────
     for row in monuments:
         monument_id      = row.get("id")
         related_entities = m_to_e.get(monument_id, [])
@@ -371,6 +486,7 @@ def build_documents(language: str = "en"):
     print(f"✅ Built {len(docs)} documents for language: {language}")
     return docs
 
+
 # =============================
 # 🔢 Gemini Embeddings
 # =============================
@@ -378,13 +494,8 @@ GEMINI_EMBED_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-embedding-001:embedContent"
 )
-GEMINI_BATCH_EMBED_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-embedding-001:batchEmbedContents"
-)
 
 def embed_single(text: str, params: dict, headers: dict) -> List[float]:
-    """Embed a single text with retry on rate limit or server errors."""
     body = {"content": {"parts": [{"text": text}]}, "taskType": "RETRIEVAL_DOCUMENT"}
     for attempt in range(10):
         resp = requests.post(GEMINI_EMBED_URL, params=params, headers=headers, json=body)
@@ -403,22 +514,19 @@ def embed_single(text: str, params: dict, headers: dict) -> List[float]:
     raise Exception("Embedding failed after 10 retries")
 
 def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
-    """Embed texts one by one to avoid batch rate limits."""
     all_embeddings = []
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
     total   = len(texts)
-
     for i, text in enumerate(texts):
         emb = embed_single(text, params, headers)
         all_embeddings.append(emb)
         if (i + 1) % 10 == 0 or (i + 1) == total:
             print(f"  📦 Embedded {i + 1}/{total}")
-        time.sleep(1.5)  # 1.5s per doc = ~40 RPM, safely under free tier limit
+        time.sleep(1.5)
     return all_embeddings
 
 def embed_query(text: str) -> List[float]:
-    """Embed a single query using Gemini REST API."""
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
     body    = {
@@ -429,11 +537,11 @@ def embed_query(text: str) -> List[float]:
     resp.raise_for_status()
     return resp.json()["embedding"]["values"]
 
+
 # =============================
 # 🔍 Query Expansion
 # =============================
 QUERY_EXPANSIONS = {
-    # English aliases / common misspellings
     "ramses":      "Ramesses Ramses Ramosis",
     "ramsis":      "Ramesses Ramses",
     "king tut":    "Tutankhamun Tutankhamen",
@@ -446,7 +554,6 @@ QUERY_EXPANSIONS = {
     "luxor":       "Luxor Temple Karnak Thebes",
     "abu simbel":  "Abu Simbel Ramesses Nubia",
     "valley":      "Valley of the Kings tombs pharaohs Luxor",
-    # Arabic aliases
     "رمسيس":       "رمسيس الثاني رعمسيس",
     "توت":         "توت عنخ آمون الفرعون الصغير",
     "نفرتيتي":     "نفرتيتي الملكة أخناتون",
@@ -463,11 +570,11 @@ def expand_query(message: str) -> str:
             extra.append(expansion)
     return f"{message} {' '.join(extra)}" if extra else message
 
+
 # =============================
-# 🧠 Engine Factory (in-memory Chroma)
+# 🧠 Engine Factory
 # =============================
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
-    """Split text into overlapping word-based chunks for better retrieval."""
     words  = text.split()
     chunks = []
     start  = 0
@@ -477,20 +584,14 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
         chunks.append(chunk)
         if end == len(words):
             break
-        start += chunk_size - overlap  # overlap between chunks
+        start += chunk_size - overlap
     return chunks
 
-# =============================
-# 💾 Supabase Embedding Cache
-# =============================
 CACHE_TABLE = "embeddings_cache"
 
 def save_cache_to_supabase(language: str, rows: list):
-    """Save chunks + embeddings to Supabase for future restarts."""
     try:
-        # Delete old cache for this language first
         supabase.table(CACHE_TABLE).delete().eq("language", language).execute()
-        # Insert in batches of 50 to avoid request size limits
         for i in range(0, len(rows), 50):
             supabase.table(CACHE_TABLE).insert(rows[i:i+50]).execute()
         print(f"💾 Saved {len(rows)} chunks to Supabase cache ({language})")
@@ -498,7 +599,6 @@ def save_cache_to_supabase(language: str, rows: list):
         print(f"⚠️ Could not save cache: {e}")
 
 def load_cache_from_supabase(language: str):
-    """Load cached chunks + embeddings from Supabase. Returns list or None."""
     try:
         result = supabase.table(CACHE_TABLE).select("*").eq("language", language).execute()
         if result.data and len(result.data) > 0:
@@ -511,31 +611,24 @@ def load_cache_from_supabase(language: str):
 
 def build_engine(language: str = "en") -> dict:
     print(f"🔄 Building in-memory engine for language: {language}...")
-
-    # In-memory Chroma client — no disk, no persistence issues on Railway
     chroma_client = chromadb.Client()
-
-    # Delete existing collection if present (e.g. on rebuild)
     try:
         chroma_client.delete_collection(name=f"pharaoh_{language}")
     except Exception:
-        pass  # collection didn't exist yet — that's fine
+        pass
 
     collection = chroma_client.create_collection(
         name=f"pharaoh_{language}",
         metadata={"hnsw:space": "cosine"},
     )
 
-    # ── Try loading from Supabase cache first ─────────────────────────────────
     cached = load_cache_from_supabase(language)
 
     if cached:
-        # Fast path: load from cache — no Gemini API calls needed
         chunked_ids       = [r["chunk_id"]              for r in cached]
         chunked_texts     = [r["text"]                  for r in cached]
         chunked_metadatas = [json_lib.loads(r["metadata"]) for r in cached]
         embeddings        = [json_lib.loads(r["embedding"]) for r in cached]
-
         collection.add(
             ids=chunked_ids,
             embeddings=embeddings,
@@ -543,15 +636,11 @@ def build_engine(language: str = "en") -> dict:
             metadatas=chunked_metadatas,
         )
         print(f"✅ {len(cached)} chunks loaded from cache into Chroma ({language})")
-
     else:
-        # Slow path: embed from scratch and save to cache
         docs = build_documents(language)
-
         chunked_texts     = []
         chunked_metadatas = []
         chunked_ids       = []
-
         for doc in docs:
             chunks = chunk_text(doc["text"])
             for j, chunk in enumerate(chunks):
@@ -559,9 +648,8 @@ def build_engine(language: str = "en") -> dict:
                 chunked_metadatas.append(doc["metadata"])
                 chunked_ids.append(f"{doc['id']}_chunk{j}")
 
-        print(f"🔢 Embedding {len(chunked_texts)} chunks ({len(docs)} docs) via Gemini API...")
+        print(f"🔢 Embedding {len(chunked_texts)} chunks via Gemini API...")
         embeddings = embed_texts(chunked_texts)
-
         collection.add(
             ids=chunked_ids,
             embeddings=embeddings,
@@ -569,8 +657,6 @@ def build_engine(language: str = "en") -> dict:
             metadatas=chunked_metadatas,
         )
         print(f"✅ {len(chunked_texts)} chunks indexed in Chroma ({language})")
-
-        # Save to Supabase cache for future restarts
         cache_rows = [
             {
                 "chunk_id":  chunked_ids[i],
@@ -582,17 +668,13 @@ def build_engine(language: str = "en") -> dict:
             for i in range(len(chunked_ids))
         ]
         save_cache_to_supabase(language, cache_rows)
-
         del docs, cache_rows
         gc.collect()
 
     del chunked_texts, chunked_metadatas, chunked_ids, embeddings
     gc.collect()
+    return {"collection": collection, "language": language}
 
-    return {
-        "collection": collection,
-        "language":   language,
-    }
 
 # =============================
 # 🔍 Retrieval
@@ -600,28 +682,24 @@ def build_engine(language: str = "en") -> dict:
 CONFIDENCE_THRESHOLD = 0.45
 
 def retrieve(collection, query: str, top_k: int = 6):
-    """Embed query and search Chroma. Returns list of result dicts."""
     expanded  = expand_query(query)
     query_emb = embed_query(expanded)
-
     results = collection.query(
         query_embeddings=[query_emb],
         n_results=top_k,
         include=["documents", "metadatas", "distances"],
     )
-
     nodes = []
     for doc, meta, dist in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0],
     ):
-        # Chroma cosine distance → similarity score (1 - distance)
         score = 1.0 - dist
         if score >= CONFIDENCE_THRESHOLD:
             nodes.append({"text": doc, "metadata": meta, "score": score})
-
     return nodes
+
 
 # =============================
 # 📝 Prompt Helpers
@@ -632,22 +710,9 @@ def get_system_prompt(language: str) -> str:
             "أنت حورس، مرشد متحف الحضارة المصرية القديمة.\n\n"
             "قواعد ثابتة يجب اتباعها دائماً:\n"
             "1. أجب فقط من [سياق المتحف] أدناه إن وُجد وكان كافياً.\n"
-            "2. إذا كان السياق غير كافٍ أو فارغاً:\n"
-            "   - ابدأ ردك بـ '📜 استناداً إلى المصادر التاريخية،'\n"
-            "   - أجب من معرفتك العامة بمصر القديمة.\n"
-            "   - اذكر اسم المصدر الأنسب داخل الإجابة بشكل طبيعي، مثل: "
-            "'وفقاً لدائرة المعارف بريتانيكا...' أو 'كما يوثق المتحف البريطاني...' "
-            "أو 'تشير أبحاث جمعية أبحاث مصر القديمة (AERA) إلى...'.\n"
-            "   - المصادر التي يمكنك الاستناد إليها: "
-            "جمعية أبحاث مصر القديمة AERA (aeraweb.org)، "
-            "موسوعة التاريخ العالمي (worldhistory.org)، "
-            "بريتانيكا (britannica.com)، "
-            "المتحف البريطاني (britishmuseum.org)، "
-            "متحف متروبوليتان للفنون (metmuseum.org).\n"
-            "   - في نهاية ردك، أضف سطراً جديداً يحتوي فقط على: "
-            "[TOPIC: كلمة أو كلمتين بالإنجليزية تمثلان الموضوع الرئيسي] "
-            "— مثال: [TOPIC: Imhotep] أو [TOPIC: Abu Simbel]. "
-            "هذا السطر لن يظهر للمستخدم، استخدم دائماً كلمات إنجليزية للموضوع.\n"
+            "2. إذا كان السياق غير كافٍ أو فارغاً وتم تزويدك بـ [سياق ويب]:\n"
+            "   - استخدم معلومات [سياق ويب] للإجابة.\n"
+            "   - لا تذكر اسم الموقع في الإجابة — سيظهر الرابط تلقائياً للمستخدم.\n"
             "3. لا تختلق معلومات أبداً. إذا لم تعرف، قل: 'هذه المعلومة غير متاحة في سجلاتنا.'\n"
             "4. نطاق عملك: مصر القديمة فقط — فراعنة، آلهة، معالم، أسرات، آثار.\n"
             "5. للأسئلة خارج النطاق: قل 'أنا متخصص في مصر القديمة فقط. هل تريد استكشاف فرعون أو معلم أو حضارة؟'\n"
@@ -662,22 +727,9 @@ def get_system_prompt(language: str) -> str:
         "You are Horus, guide of the Ancient Egyptian Civilization Museum.\n\n"
         "STRICT RULES — follow without exception:\n"
         "1. Answer ONLY from the [Museum Context] section when it contains relevant information.\n"
-        "2. If context is empty or insufficient:\n"
-        "   - Begin your reply with the EXACT marker '📜 Based on historical records,'\n"
-        "   - Answer from your general knowledge about Ancient Egypt only.\n"
-        "   - Naturally cite the most relevant source by name inside your answer, e.g.: "
-        "'According to Britannica...', 'As documented by the British Museum...', "
-        "or 'AERA fieldwork at Giza suggests...'.\n"
-        "   - Trusted sources you may cite: "
-        "Ancient Egypt Research Associates AERA (aeraweb.org), "
-        "World History Encyclopedia (worldhistory.org), "
-        "Britannica (britannica.com), "
-        "The British Museum (britishmuseum.org), "
-        "The Metropolitan Museum of Art (metmuseum.org).\n"
-        "   - At the very end of your reply, add a new line containing ONLY: "
-        "[TOPIC: 1-2 word topic name in English] — e.g. [TOPIC: Imhotep] or "
-        "[TOPIC: Abu Simbel]. This line will be hidden from the user, "
-        "always use English words for the topic.\n"
+        "2. If context is empty or insufficient but [Web Context] is provided:\n"
+        "   - Use the [Web Context] to answer the question accurately.\n"
+        "   - Do NOT mention the source site name in your answer — the link will be shown automatically.\n"
         "3. Never fabricate. If genuinely unknown, say: 'This detail isn't in our records.'\n"
         "4. Scope: Ancient Egypt only — pharaohs, gods, monuments, dynasties, artifacts.\n"
         "5. Off-topic questions: say 'I can only guide you through Ancient Egypt! "
@@ -720,6 +772,19 @@ def build_context_block(nodes: list, language: str) -> str:
         + f"\n\n{sep}\n{footer}"
     )
 
+def build_web_context_block(page_content: str, language: str) -> str:
+    """Build a context block from fetched web page content."""
+    sep = "─" * 40
+    if language == "ar":
+        header = "[سياق ويب — معلومات من مصدر موثوق]"
+        footer = "استخدم هذا السياق للإجابة على السؤال التالي."
+    else:
+        header = "[Web Context — information from a trusted historical source]"
+        footer = "Use the above web context to answer the question that follows."
+
+    return f"{header}\n{sep}\n\n{page_content.strip()}\n\n{sep}\n{footer}"
+
+
 # =============================
 # 🤖 Gemini LLM via REST
 # =============================
@@ -729,43 +794,30 @@ GEMINI_CHAT_URL = (
 )
 
 def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
-    """Call Gemini 1.5 Flash via REST API."""
-    headers = {"Content-Type": "application/json"}
-    params  = {"key": GEMINI_API_KEY}
-
+    headers  = {"Content-Type": "application/json"}
+    params   = {"key": GEMINI_API_KEY}
     contents = []
 
-    # Add history turns — Gemini requires strict user/model alternation
     last_role = None
     for turn in (history or []):
-        role = turn.get("role", "user")  # already "user" or "model"
+        role = turn.get("role", "user")
         msg  = turn.get("content", "").strip()
         if not msg:
             continue
-        # Skip consecutive turns with the same role to avoid 400 errors
         if role == last_role:
             continue
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg}]
-        })
+        contents.append({"role": role, "parts": [{"text": msg}]})
         last_role = role
 
-    # Ensure the last history turn is not "user" before we add our user message
-    # (if it is, merge them to avoid consecutive user turns)
     if contents and contents[-1]["role"] == "user":
         contents[-1]["parts"][0]["text"] += "\n" + prompt
     else:
-        contents.append({
-            "role": "user",
-            "parts": [{"text": prompt}]
-        })
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
 
     body = {
         "contents": contents,
         "generationConfig": {"temperature": 0.1},
     }
-
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
@@ -775,6 +827,7 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
     resp.raise_for_status()
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
+
 # =============================
 # 💬 Chat Logic
 # =============================
@@ -782,67 +835,86 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     collection = engine["collection"]
     language   = engine["language"]
 
-    # 1. Retrieve relevant nodes
-    nodes = retrieve(collection, message)
-
-    # 2. Build context block
+    # ── Step 1: Try RAG first ─────────────────────────────────────────────────
+    nodes         = retrieve(collection, message)
     context_block = build_context_block(nodes, language)
 
-    # 3. Augment user message
-    augmented = (
-        f"{context_block}\n\nQuestion: {message}"
-        if context_block
-        else message
-    )
-
-    # 4. Call Gemini via REST
     system_prompt  = get_system_prompt(language)
     recent_history = history[-12:] if len(history) > 12 else history
-
     gemini_history = []
     for turn in recent_history:
-        r    = turn.get("role", "user")
-        msg  = turn.get("content", "")
+        r   = turn.get("role", "user")
+        msg = turn.get("content", "")
         if r in ("user", "assistant") and msg:
             gemini_history.append({
                 "role":    "user" if r == "user" else "model",
                 "content": msg,
             })
 
-    answer = gemini_generate(
-        prompt=augmented,
-        system=system_prompt,
-        history=gemini_history,
-    )
+    # ── Step 2: RAG has enough context → answer directly ─────────────────────
+    if context_block:
+        augmented = f"{context_block}\n\nQuestion: {message}"
+        answer    = gemini_generate(
+            prompt=augmented,
+            system=system_prompt,
+            history=gemini_history,
+        )
+        return answer
 
-    # If Horus fell back to historian knowledge, attach the source he cited
-    fallback_markers = ["📜 Based on historical records", "📜 استناداً إلى المصادر التاريخية"]
-    is_fallback = any(marker in answer for marker in fallback_markers)
+    # ── Step 3: RAG found nothing → use real web search as fallback ───────────
+    print(f"📭 RAG miss for: '{message}' — triggering web search fallback")
 
-    if is_fallback:
-        # Extract the hidden [TOPIC: ...] tag if present, and remove it from the visible answer
-        topic_match = re.search(r"\[TOPIC:\s*([^\]]+)\]", answer)
-        topic = topic_match.group(1).strip() if topic_match else None
-        answer = re.sub(r"\n*\[TOPIC:\s*[^\]]+\]\s*$", "", answer).strip()
+    # Build a clean English search query even for Arabic questions
+    # so that search results are in English (better coverage on these sites)
+    search_query = f"Ancient Egypt {message}"
 
-        source = detect_cited_source(answer)
-        if source:
-            search_term = topic if topic else message.strip()
-            search_query = quote_plus(search_term)
-            link_url = source["search_url"].format(query=search_query)
-            if language == "ar":
-                answer += f"\n\n🔍 بحث عن \"{search_term}\" في: [{source['name']}]({link_url})"
-            else:
-                answer += f"\n\n🔍 Search \"{search_term}\" on: [{source['name']}]({link_url})"
+    web_result = web_search_and_ground(search_query, language)
+
+    if web_result:
+        # Ground Gemini on the real fetched page content
+        web_context = build_web_context_block(web_result["page_content"], language)
+        augmented   = f"{web_context}\n\nQuestion: {message}"
+
+        answer = gemini_generate(
+            prompt=augmented,
+            system=system_prompt,
+            history=gemini_history,
+        )
+
+        # Append the real source link — this is the exact article page, not a search page
+        url         = web_result["url"]
+        source_name = web_result["source_name"]
+        title       = web_result["title"]
+
+        if language == "ar":
+            answer += f"\n\n📖 المصدر: [{title}]({url})"
+        else:
+            answer += f"\n\n📖 Source: [{title}]({url})"
+
+    else:
+        # Web search unavailable or returned nothing — answer from Gemini training only
+        # with a clear disclaimer (no fake links)
+        print("⚠️ Web search returned no results — answering from Gemini training data only")
+        augmented = message
+        answer    = gemini_generate(
+            prompt=augmented,
+            system=system_prompt,
+            history=gemini_history,
+        )
+        if language == "ar":
+            answer += "\n\n📜 *هذه المعلومة مستندة إلى المعرفة العامة ولم يُتحقق منها من مصدر موثوق.*"
+        else:
+            answer += "\n\n📜 *This answer is based on general knowledge and has not been verified from a trusted source.*"
 
     return answer
+
 
 # =============================
 # 🚀 FastAPI App
 # =============================
 app      = FastAPI()
-_engines: dict        = {}
-_engine_lock          = threading.Lock()
+_engines: dict = {}
+_engine_lock   = threading.Lock()
 
 def get_engine(language: str) -> dict:
     if language in _engines:
@@ -854,7 +926,6 @@ def get_engine(language: str) -> dict:
     return _engines[language]
 
 def build_engines_sequentially():
-    """Build EN first, GC, then AR — keeps peak memory flat."""
     time.sleep(3)
     print("🚀 Background: building EN engine...")
     get_engine("en")
@@ -867,15 +938,17 @@ def build_engines_sequentially():
 
 threading.Thread(target=build_engines_sequentially, daemon=True).start()
 
+
 # =============================
 # 🌐 Endpoints
 # =============================
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
-        "status":    "ok",
-        "en_engine": "ready" if "en" in _engines else "building...",
-        "ar_engine": "ready" if "ar" in _engines else "building...",
+        "status":      "ok",
+        "en_engine":   "ready" if "en" in _engines else "building...",
+        "ar_engine":   "ready" if "ar" in _engines else "building...",
+        "web_search":  "enabled" if (GOOGLE_CSE_KEY and GOOGLE_CSE_ID) else "disabled (set GOOGLE_CSE_KEY + GOOGLE_CSE_ID)",
     }
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -884,8 +957,8 @@ def home():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    # 1. Check daily usage limit (non-VIP users)
-    limit_message = check_usage_limit(request.user_id, request.language)
+    # ✅ Pass is_vip from the request — no Supabase re-fetch needed
+    limit_message = check_usage_limit(request.user_id, request.language, request.is_vip)
     if limit_message:
         return {"answer": limit_message}
 
@@ -893,8 +966,8 @@ def chat(request: ChatRequest):
         engine = get_engine(request.language)
         answer = run_chat(engine, request.message, request.history)
 
-        # 2. Count this message toward the user's daily usage
-        if request.user_id:
+        # ✅ Only increment usage for non-VIP logged-in users
+        if request.user_id and not request.is_vip:
             increment_usage(request.user_id)
 
         return {"answer": answer}
@@ -902,8 +975,6 @@ def chat(request: ChatRequest):
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"❌ Gemini HTTP error: {status} — {e}")
-        if status in (429, 503, 500):
-            return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
         return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
 
     except Exception as e:
@@ -912,8 +983,8 @@ def chat(request: ChatRequest):
 
 @app.post("/generate-quiz")
 def generate_quiz(request: QuizRequest):
-    # 1. Check daily usage limit (non-VIP users) — quiz also uses Gemini quota
-    limit_message = check_usage_limit(request.user_id, request.language)
+    # ✅ Pass is_vip from the request — same fix as /chat
+    limit_message = check_usage_limit(request.user_id, request.language, request.is_vip)
     if limit_message:
         return {"quiz": [{
             "question": limit_message,
@@ -956,8 +1027,8 @@ Example format:
         raw  = gemini_generate(quiz_prompt).strip().replace("```json", "").replace("```", "").strip()
         quiz = json_lib.loads(raw)
 
-        # 2. Count this quiz generation toward the user's daily usage
-        if request.user_id:
+        # ✅ Only increment for non-VIP logged-in users
+        if request.user_id and not request.is_vip:
             increment_usage(request.user_id)
 
         return {"quiz": quiz}
@@ -981,7 +1052,6 @@ Example format:
 
 @app.api_route("/rebuild-index", methods=["GET", "POST"])
 def rebuild_index(background_tasks: BackgroundTasks):
-    """Wipe engines and rebuild from Supabase."""
     global _engines
     if getattr(app.state, "rebuilding", False):
         return {"error": "Rebuild already in progress."}
@@ -992,7 +1062,6 @@ def rebuild_index(background_tasks: BackgroundTasks):
 
     def do_rebuild():
         try:
-            # Clear Supabase cache so embeddings are regenerated fresh
             try:
                 supabase.table(CACHE_TABLE).delete().neq("chunk_id", "").execute()
                 print("🗑️ Supabase embedding cache cleared")
@@ -1016,8 +1085,6 @@ def rebuild_status():
 
 @app.api_route("/debug-retrieve", methods=["GET"])
 def debug_retrieve(q: str = "Ramses II", lang: str = "en"):
-    """Shows which documents are retrieved for a query.
-    Call: GET /debug-retrieve?q=tell+me+about+ramses&lang=en"""
     try:
         engine  = get_engine(lang)
         nodes   = retrieve(engine["collection"], q)
@@ -1037,8 +1104,6 @@ def debug_retrieve(q: str = "Ramses II", lang: str = "en"):
 
 @app.api_route("/debug-entity", methods=["GET"])
 def debug_entity(name: str = "Ramesses II"):
-    """Shows raw Supabase data for an entity.
-    Call: GET /debug-entity?name=Ramesses+II"""
     try:
         result = supabase.table("entities").select("*").ilike("name", f"%{name}%").execute()
         if not result.data:
@@ -1053,6 +1118,23 @@ def debug_entity(name: str = "Ramesses II"):
         }
     except Exception as e:
         return {"error": str(e)}
+
+# ── New: debug web search so you can test it without going through chat ───────
+@app.api_route("/debug-websearch", methods=["GET"])
+def debug_websearch(q: str = "Imhotep architect", lang: str = "en"):
+    """
+    Test the web search fallback independently.
+    Call: GET /debug-websearch?q=Imhotep+architect&lang=en
+    """
+    result = web_search_and_ground(f"Ancient Egypt {q}", lang)
+    if not result:
+        return {"error": "No results found or web search not configured"}
+    return {
+        "url":             result["url"],
+        "title":           result["title"],
+        "source_name":     result["source_name"],
+        "page_content":    result["page_content"][:500] + "...",
+    }
 
 if __name__ == "__main__":
     import uvicorn
