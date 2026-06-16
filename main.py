@@ -803,7 +803,7 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
 # 💬 Chat Logic
 # =============================
 # Add this near CONFIDENCE_THRESHOLD at the top of the file:
-TOP_SCORE_THRESHOLD = 0.75
+TOP_SCORE_THRESHOLD = 0.70
 
 # =============================
 # 💬 Chat Logic
