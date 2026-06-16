@@ -148,11 +148,11 @@ def fetch_page_content(url: str, max_chars: int = 3000) -> str:
 
 def web_search_and_ground(query: str) -> dict | None:
     """
-    Full web fallback pipeline:
-      1. Search Google CSE across all trusted domains
-      2. Fetch the top result's page content for Gemini grounding
-      3. Return {url, title, source_name, page_content} or None
-    """
+Full web fallback pipeline:
+  1. Search via SerpAPI across trusted domains
+  2. Fetch the top result's page content for Gemini grounding
+  3. Return {url, title, source_name, page_content} or None
+"""
     results = web_search_trusted(query)
     if not results:
         return None
@@ -802,6 +802,12 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
 # =============================
 # 💬 Chat Logic
 # =============================
+# Add this near CONFIDENCE_THRESHOLD at the top of the file:
+TOP_SCORE_THRESHOLD = 0.60
+
+# =============================
+# 💬 Chat Logic
+# =============================
 def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     collection = engine["collection"]
     language   = engine["language"]
@@ -814,37 +820,41 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
         if t.get("role") in ("user", "assistant") and t.get("content", "")
     ]
 
-    # ── Step 1: Greetings — respond directly, no RAG or web search needed ─────
+    # ── Step 1: Greetings ─────────────────────────────────────────────────────
     if is_greeting(message):
         print(f"👋 Greeting detected — responding directly")
         return gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
 
-    # ── Step 2: Conversational follow-ups — answer from history, skip RAG ─────
+    # ── Step 2: Conversational follow-ups ─────────────────────────────────────
     if is_conversational(message):
         print(f"💬 Follow-up detected — answering from conversation history")
         return gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
 
-    # ── Step 3: Try RAG on the factual question ───────────────────────────────
+    # ── Step 3: RAG ───────────────────────────────────────────────────────────
     nodes         = retrieve(collection, message)
     context_block = build_context_block(nodes, language)
+    top_score     = nodes[0]["score"] if nodes else 0
 
-    if context_block:
-        print(f"✅ RAG hit — answering from museum data")
+    if context_block and top_score >= TOP_SCORE_THRESHOLD:
+        print(f"✅ RAG high confidence (score {top_score:.3f}) — answering from museum data")
         augmented = f"{context_block}\n\nQuestion: {message}"
         return gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
 
-    # ── Step 4: RAG missed → try trusted web sources ──────────────────────────
-    print(f"📭 RAG miss for: '{message}' — trying web search")
+    if context_block:
+        print(f"⚠️ RAG low confidence (score {top_score:.3f}) — trying web search first")
+    else:
+        print(f"📭 RAG miss — trying web search for: '{message}'")
+
+    # ── Step 4: Web search ────────────────────────────────────────────────────
     search_query = f"Ancient Egypt {message}"
     web_result   = web_search_and_ground(search_query)
 
     if web_result:
         print(f"🌐 Web hit: {web_result['url']}")
         web_context = build_web_context_block(web_result["page_content"], language)
-        augmented   = f"{web_context}\n\nQuestion: {message}"
+        combined    = f"{web_context}\n\n{context_block}" if context_block else web_context
+        augmented   = f"{combined}\n\nQuestion: {message}"
         answer      = gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
-
-        # Append the real article link — not a search page
         url   = web_result["url"]
         title = web_result["title"]
         if language == "ar":
@@ -853,7 +863,13 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
             answer += f"\n\n📖 Source: [{title}]({url})"
         return answer
 
-    # ── Step 5: Nothing found anywhere — answer from Gemini knowledge + disclaimer ──
+    # ── Step 5: Web missed — fall back to low-confidence RAG ─────────────────
+    if context_block:
+        print(f"🔄 Web miss — falling back to RAG result (score {top_score:.3f})")
+        augmented = f"{context_block}\n\nQuestion: {message}"
+        return gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
+
+    # ── Step 6: Nothing found — Gemini knowledge + disclaimer ─────────────────
     print("No results from RAG or web — answering from Gemini knowledge with disclaimer")
     answer = gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
     if language == "ar":
@@ -863,7 +879,6 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
         answer += "\n\n---\n"
         answer += "⚠️ *Note: This answer is based on Horus's general knowledge and has not been sourced from our museum database or trusted historical references.*"
     return answer
-
 
 # =============================
 # 🚀 FastAPI App
