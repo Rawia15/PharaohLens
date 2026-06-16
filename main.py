@@ -886,6 +886,7 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
             answer += f"\n\n---\n🌐 *استناداً إلى مصادر تاريخية موثوقة.* 📖 [{title}]({url})"
         else:
             answer += f"\n\n---\n🌐 *Based on trusted historical sources.* 📖 [{title}]({url})"
+        return answer  # ← THIS WAS MISSING
 
     # ── Step 5: Nothing found (web miss or no RAG) — Gemini general knowledge ──
     print("🔄 No confident source found — answering from Gemini general knowledge")
