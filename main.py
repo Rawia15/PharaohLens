@@ -8,7 +8,6 @@ import json as json_lib
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
 from typing import List
 
 import chromadb
@@ -21,11 +20,11 @@ import requests
 # =============================
 # 🔐 ENV & CLIENTS
 # =============================
-SUPABASE_URL      = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY      = os.environ.get("SUPABASE_KEY")
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
-GOOGLE_CSE_KEY    = os.environ.get("GOOGLE_CSE_KEY")    # Google Custom Search API key
-GOOGLE_CSE_ID     = os.environ.get("GOOGLE_CSE_ID")     # Your Programmable Search Engine ID
+SUPABASE_URL   = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY   = os.environ.get("SUPABASE_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GOOGLE_CSE_KEY = os.environ.get("GOOGLE_CSE_KEY")
+GOOGLE_CSE_ID  = os.environ.get("GOOGLE_CSE_ID")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     raise ValueError(
@@ -66,7 +65,7 @@ TRUSTED_SOURCES = [
     },
     {
         "name": "Egyptian Museum Cairo",
-        "url":  "https://egyptianmuseumcairo.eg/",
+        "url":  "https://egyptianmuseum.gov.eg",
         "desc": "Primary Egyptian government museum — direct artifact source",
     },
     {
@@ -76,7 +75,7 @@ TRUSTED_SOURCES = [
     },
     {
         "name": "The Louvre Museum",
-        "url":  "https://louvre.fr/en",
+        "url":  "https://louvre.fr",
         "desc": "Second largest Egyptian collection in the world",
     },
     {
@@ -86,29 +85,23 @@ TRUSTED_SOURCES = [
     },
 ]
 
+# Domains used to restrict the Google Custom Search Engine.
+# NOTE: louvre.fr/en → louvre.fr (CSE matches by domain, not path)
 TRUSTED_DOMAINS = [s["url"].replace("https://", "") for s in TRUSTED_SOURCES]
-# → ["aeraweb.org", "worldhistory.org", "britannica.com", "britishmuseum.org",
-#    "metmuseum.org", "egyptianmuseum.gov.eg", "si.edu", "louvre.fr/en", "whc.unesco.org"]
 
 # =============================
 # 🔎 Google Custom Search
 # =============================
 GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 
+
 def web_search_trusted(query: str, num_results: int = 3) -> list[dict]:
     """
     Search trusted Egyptology sites via Google Custom Search API.
-    Returns a list of {title, url, snippet} dicts, or [] on failure.
-
-    Setup (one-time):
-      1. Go to https://programmablesearchengine.google.com/
-      2. Create a new search engine, add the 5 trusted domains under "Sites to search"
-      3. Copy the Search Engine ID → set as GOOGLE_CSE_ID env var
-      4. Go to https://console.cloud.google.com/ → APIs → Custom Search JSON API → enable it
-      5. Create an API key → set as GOOGLE_CSE_KEY env var
+    Returns a list of {title, url, snippet} dicts, or [] on any failure.
     """
     if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
-        print("⚠️ GOOGLE_CSE_KEY or GOOGLE_CSE_ID not set — web search fallback disabled")
+        print("⚠️ GOOGLE_CSE_KEY or GOOGLE_CSE_ID not set — web search disabled")
         return []
 
     try:
@@ -121,14 +114,15 @@ def web_search_trusted(query: str, num_results: int = 3) -> list[dict]:
         resp = requests.get(GOOGLE_CSE_ENDPOINT, params=params, timeout=8)
         resp.raise_for_status()
         items = resp.json().get("items", [])
-        results = []
-        for item in items:
-            results.append({
+        results = [
+            {
                 "title":   item.get("title", ""),
                 "url":     item.get("link", ""),
                 "snippet": item.get("snippet", ""),
-            })
-        print(f"🔍 Web search for '{query}' → {len(results)} results")
+            }
+            for item in items
+        ]
+        print(f"🔍 Web search '{query}' → {len(results)} results")
         return results
     except Exception as e:
         print(f"⚠️ Web search failed: {e}")
@@ -137,59 +131,54 @@ def web_search_trusted(query: str, num_results: int = 3) -> list[dict]:
 
 def fetch_page_content(url: str, max_chars: int = 3000) -> str:
     """
-    Fetch the text content of a page to give Gemini real grounding context.
-    Uses a simple extraction — good enough for article-style pages.
-    Falls back to empty string on any error.
+    Fetch and clean the text content of a page.
+    Returns empty string on any error (paywall, timeout, etc.).
     """
     try:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; PharaohLensBot/1.0)"}
         resp = requests.get(url, headers=headers, timeout=8)
         resp.raise_for_status()
 
-        # Strip HTML tags with a lightweight regex (no BeautifulSoup dependency)
         text = re.sub(r"<style[^>]*>.*?</style>", " ", resp.text, flags=re.DOTALL)
         text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL)
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-
-        # Trim to max_chars so we don't blow up the Gemini context window
         return text[:max_chars]
     except Exception as e:
         print(f"⚠️ Could not fetch {url}: {e}")
         return ""
 
 
-def web_search_and_ground(query: str, language: str) -> dict | None:
+def web_search_and_ground(query: str) -> dict | None:
     """
-    Full fallback pipeline:
-      1. Search Google CSE for the query across trusted domains
-      2. Fetch the top result's page content
-      3. Return {url, title, source_name, page_content} for Gemini to use
-
-    Returns None if no useful results found or CSE is not configured.
+    Full web fallback pipeline:
+      1. Search Google CSE across all trusted domains
+      2. Fetch the top result's page content for Gemini grounding
+      3. Return {url, title, source_name, page_content} or None
     """
     results = web_search_trusted(query)
     if not results:
         return None
 
-    # Take the best result (Google CSE already ranks by relevance)
     best = results[0]
     url  = best["url"]
 
-    # Identify which trusted source this belongs to
-    source_name = None
+    # Match the result URL back to a source name
+    source_name = url  # fallback to raw URL
     for source in TRUSTED_SOURCES:
         domain = source["url"].replace("https://", "")
         if domain in url:
             source_name = source["name"]
             break
-    source_name = source_name or url  # fallback to raw URL if unmatched
 
-    # Fetch the real page content to ground Gemini's answer
+    # Fetch real page content; fall back to snippet if page is blocked/empty
     page_content = fetch_page_content(url)
     if not page_content:
-        # No content fetched — still return the URL, just without grounding
-        page_content = best["snippet"]  # use snippet as minimal context
+        page_content = best["snippet"]
+
+    # If we still have nothing useful, skip this result entirely
+    if not page_content or len(page_content.strip()) < 50:
+        return None
 
     return {
         "url":          url,
@@ -200,7 +189,38 @@ def web_search_and_ground(query: str, language: str) -> dict | None:
 
 
 # =============================
-# 🚦 Usage Limits (non-VIP users)
+# 🔍 Conversation Type Detection
+# =============================
+CONVERSATIONAL_PATTERNS = [
+    # English follow-up / meta questions
+    r"\b(you just said|you mentioned|you told me|you said|from where|where did you get|what did you mean|can you explain|tell me more|elaborate|go on|continue|what about|how about|and what|so what|why did|how did you|based on what|according to whom|your source|your answer|previous(ly)?|earlier|above|that information|those details)\b",
+    # Arabic follow-up / meta questions
+    r"(قلت|ذكرت|أخبرتني|من أين|من أين حصلت|ماذا قصدت|وضّح|اشرح|أكمل|تابع|وماذا عن|وكيف|ولماذا|مصدرك|إجابتك|معلوماتك|سابقاً|قبل قليل|ما قلته)",
+]
+
+# Greetings that need no RAG or web search
+GREETING_PATTERNS = [
+    r"^\s*(hi|hello|hey|good morning|good evening|مرحبا|أهلا|السلام عليكم|صباح الخير|مساء الخير)\s*[!?.]*\s*$"
+]
+
+def is_conversational(message: str) -> bool:
+    """Returns True if the message is a follow-up or meta question, not a factual query."""
+    msg = message.lower().strip()
+    for pattern in CONVERSATIONAL_PATTERNS:
+        if re.search(pattern, msg, re.IGNORECASE):
+            return True
+    return False
+
+def is_greeting(message: str) -> bool:
+    msg = message.lower().strip()
+    for pattern in GREETING_PATTERNS:
+        if re.search(pattern, msg, re.IGNORECASE):
+            return True
+    return False
+
+
+# =============================
+# 🚦 Usage Limits
 # =============================
 DAILY_MESSAGE_LIMIT = 10
 USAGE_TABLE         = "chat_usage"
@@ -229,17 +249,6 @@ SERVICE_BUSY_MESSAGE = {
     ),
 }
 
-def is_vip_user(user_id: str) -> bool:
-    if not user_id:
-        return False
-    try:
-        result = supabase.table("users").select("is_vip").eq("id", user_id).execute()
-        if result.data and len(result.data) > 0:
-            return bool(result.data[0].get("is_vip", False))
-    except Exception as e:
-        print(f"⚠️ Could not check VIP status: {e}")
-    return False
-
 def get_today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -252,7 +261,7 @@ def get_today_usage(user_id: str) -> int:
             .eq("usage_date", get_today_utc())
             .execute()
         )
-        if result.data and len(result.data) > 0:
+        if result.data:
             return result.data[0].get("message_count", 0)
     except Exception as e:
         print(f"⚠️ Could not read usage: {e}")
@@ -268,23 +277,10 @@ def increment_usage(user_id: str):
         print(f"⚠️ Could not update usage: {e}")
 
 def check_usage_limit(user_id: str, language: str, is_vip: bool = False) -> str | None:
-    """
-    Returns a limit-reached message if the user exceeded their daily quota, else None.
-
-    is_vip is passed directly from the client request — the Android app already
-    has the correct VIP state from its own auth flow. We do NOT re-query Supabase
-    here because:
-      1. It adds latency to every single message.
-      2. A query failure would silently return False, blocking real VIP users.
-      3. The client value is already verified against Supabase at login time.
-
-    Guests (empty user_id) are not tracked server-side.
-    VIP users bypass the limit entirely — their usage is also not incremented.
-    """
     if not user_id:
-        return None   # guest — not tracked
+        return None
     if is_vip:
-        return None   # VIP — no limit, skip everything
+        return None
     usage = get_today_usage(user_id)
     if usage >= DAILY_MESSAGE_LIMIT:
         return LIMIT_REACHED_MESSAGE.get(language, LIMIT_REACHED_MESSAGE["en"])
@@ -299,16 +295,13 @@ class ChatRequest(BaseModel):
     history: List[dict]
     language: str = "en"
     user_id: str = ""
-    # ✅ FIX: Client sends is_vip directly — avoids a fragile Supabase re-check
-    # on every single message. The Android app already knows VIP state reliably.
-    # Defaults to False so old app versions keep working without crashing.
     is_vip: bool = False
 
 class QuizRequest(BaseModel):
     chat_history: List[str]
     language: str = "en"
     user_id: str = ""
-    is_vip: bool = False  # ✅ same fix for quiz endpoint
+    is_vip: bool = False
 
 
 # =============================
@@ -372,7 +365,6 @@ def build_documents(language: str = "en"):
             dynasty   = e.get("dynasty_ar") or e.get("dynasty", "")
             json_text = parse_json_field(e.get("json_ar") or e.get("json", "{}"))
             extra     = (e.get("chatbot_extra_ar") or e.get("chatbot_extra") or "").strip()
-
             monuments_section = ""
             if related_monuments:
                 m_lines = []
@@ -382,10 +374,7 @@ def build_documents(language: str = "en"):
                     m_city    = m.get("city_ar") or m.get("city", "")
                     m_json    = parse_json_field(m.get("json_ar") or m.get("json", "{}"))
                     m_lines.append(f"  • {m_name} — {m_details} (المدينة: {m_city})\n{m_json}")
-                monuments_section = (
-                    f"\nالمعالم والآثار المرتبطة بـ {name}:\n" + "\n".join(m_lines)
-                )
-
+                monuments_section = f"\nالمعالم والآثار المرتبطة بـ {name}:\n" + "\n".join(m_lines)
             text = (
                 f"شخصية تاريخية: {name}. فرعون: {name}. سيرة ذاتية: {name}.\n"
                 f"سجل الشخصية التاريخية — {name}\n\n"
@@ -400,7 +389,6 @@ def build_documents(language: str = "en"):
             dynasty   = e.get("dynasty", "")
             json_text = parse_json_field(e.get("json", "{}"))
             extra     = (e.get("chatbot_extra") or "").strip()
-
             monuments_section = ""
             if related_monuments:
                 m_lines = []
@@ -414,7 +402,6 @@ def build_documents(language: str = "en"):
                     f"\nMONUMENTS & ARTIFACTS ASSOCIATED WITH {name.upper()}:\n"
                     + "\n".join(m_lines)
                 )
-
             text = (
                 f"HISTORICAL FIGURE: {name}. PHARAOH: {name}. PERSON: {name}. BIOGRAPHY OF {name}.\n"
                 f"HISTORICAL FIGURE RECORD — {name}\n\n"
@@ -440,7 +427,6 @@ def build_documents(language: str = "en"):
             details   = row.get("notable_details_ar") or row.get("notable_details", "")
             city      = row.get("city_ar") or row.get("city", "")
             location  = row.get("current_location_ar") or row.get("currentLocation", "")
-
             figures_section = ""
             if related_entities:
                 fig_names = [(e.get("name_ar") or e.get("name", "")) for e in related_entities]
@@ -448,7 +434,6 @@ def build_documents(language: str = "en"):
                     f"\nالشخصيات التاريخية المرتبطة بهذا المعلم:\n"
                     + "\n".join(f"  • {n}" for n in fig_names if n)
                 )
-
             text = (
                 f"معلم تاريخي: {m_name}. هذه الوثيقة تتحدث عن {m_name}.\n"
                 f"سجل المعلم — {m_name}\n\n"
@@ -461,7 +446,6 @@ def build_documents(language: str = "en"):
             details   = row.get("notable_details", "")
             city      = row.get("city", "")
             location  = row.get("currentLocation", "")
-
             figures_section = ""
             if related_entities:
                 fig_names = [e.get("name", "") for e in related_entities]
@@ -469,7 +453,6 @@ def build_documents(language: str = "en"):
                     f"\nHISTORICAL FIGURES ASSOCIATED WITH THIS MONUMENT:\n"
                     + "\n".join(f"  • {n}" for n in fig_names if n)
                 )
-
             text = (
                 f"MONUMENT: {m_name}. This document is about {m_name}.\n"
                 f"MONUMENT RECORD — {m_name}\n\n"
@@ -506,14 +489,14 @@ def embed_single(text: str, params: dict, headers: dict) -> List[float]:
             continue
         if resp.status_code in (500, 503):
             wait = 5 * (attempt + 1)
-            print(f"  ⏳ Gemini server error {resp.status_code}, waiting {wait}s...")
+            print(f"  ⏳ Server error {resp.status_code}, waiting {wait}s...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
         return resp.json()["embedding"]["values"]
     raise Exception("Embedding failed after 10 retries")
 
-def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
+def embed_texts(texts: List[str]) -> List[List[float]]:
     all_embeddings = []
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
@@ -529,10 +512,7 @@ def embed_texts(texts: List[str], batch_size: int = 5) -> List[List[float]]:
 def embed_query(text: str) -> List[float]:
     headers = {"Content-Type": "application/json"}
     params  = {"key": GEMINI_API_KEY}
-    body    = {
-        "content": {"parts": [{"text": text}]},
-        "taskType": "RETRIEVAL_QUERY",
-    }
+    body    = {"content": {"parts": [{"text": text}]}, "taskType": "RETRIEVAL_QUERY"}
     resp = requests.post(GEMINI_EMBED_URL, params=params, headers=headers, json=body)
     resp.raise_for_status()
     return resp.json()["embedding"]["values"]
@@ -580,8 +560,7 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
     start  = 0
     while start < len(words):
         end   = min(start + chunk_size, len(words))
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
+        chunks.append(" ".join(words[start:end]))
         if end == len(words):
             break
         start += chunk_size - overlap
@@ -601,8 +580,8 @@ def save_cache_to_supabase(language: str, rows: list):
 def load_cache_from_supabase(language: str):
     try:
         result = supabase.table(CACHE_TABLE).select("*").eq("language", language).execute()
-        if result.data and len(result.data) > 0:
-            print(f"⚡ Loaded {len(result.data)} cached chunks from Supabase ({language})")
+        if result.data:
+            print(f"⚡ Loaded {len(result.data)} cached chunks ({language})")
             return result.data
         return None
     except Exception as e:
@@ -610,7 +589,7 @@ def load_cache_from_supabase(language: str):
         return None
 
 def build_engine(language: str = "en") -> dict:
-    print(f"🔄 Building in-memory engine for language: {language}...")
+    print(f"🔄 Building engine for language: {language}...")
     chroma_client = chromadb.Client()
     try:
         chroma_client.delete_collection(name=f"pharaoh_{language}")
@@ -625,39 +604,33 @@ def build_engine(language: str = "en") -> dict:
     cached = load_cache_from_supabase(language)
 
     if cached:
-        chunked_ids       = [r["chunk_id"]              for r in cached]
-        chunked_texts     = [r["text"]                  for r in cached]
-        chunked_metadatas = [json_lib.loads(r["metadata"]) for r in cached]
-        embeddings        = [json_lib.loads(r["embedding"]) for r in cached]
         collection.add(
-            ids=chunked_ids,
-            embeddings=embeddings,
-            documents=chunked_texts,
-            metadatas=chunked_metadatas,
+            ids        =[r["chunk_id"]               for r in cached],
+            embeddings =[json_lib.loads(r["embedding"]) for r in cached],
+            documents  =[r["text"]                   for r in cached],
+            metadatas  =[json_lib.loads(r["metadata"]) for r in cached],
         )
-        print(f"✅ {len(cached)} chunks loaded from cache into Chroma ({language})")
+        print(f"✅ {len(cached)} chunks loaded from cache ({language})")
     else:
-        docs = build_documents(language)
+        docs              = build_documents(language)
         chunked_texts     = []
         chunked_metadatas = []
         chunked_ids       = []
         for doc in docs:
-            chunks = chunk_text(doc["text"])
-            for j, chunk in enumerate(chunks):
+            for j, chunk in enumerate(chunk_text(doc["text"])):
                 chunked_texts.append(chunk)
                 chunked_metadatas.append(doc["metadata"])
                 chunked_ids.append(f"{doc['id']}_chunk{j}")
 
-        print(f"🔢 Embedding {len(chunked_texts)} chunks via Gemini API...")
+        print(f"🔢 Embedding {len(chunked_texts)} chunks via Gemini...")
         embeddings = embed_texts(chunked_texts)
         collection.add(
-            ids=chunked_ids,
-            embeddings=embeddings,
-            documents=chunked_texts,
-            metadatas=chunked_metadatas,
+            ids=chunked_ids, embeddings=embeddings,
+            documents=chunked_texts, metadatas=chunked_metadatas,
         )
-        print(f"✅ {len(chunked_texts)} chunks indexed in Chroma ({language})")
-        cache_rows = [
+        print(f"✅ {len(chunked_texts)} chunks indexed ({language})")
+
+        save_cache_to_supabase(language, [
             {
                 "chunk_id":  chunked_ids[i],
                 "language":  language,
@@ -666,12 +639,10 @@ def build_engine(language: str = "en") -> dict:
                 "embedding": json_lib.dumps(embeddings[i]),
             }
             for i in range(len(chunked_ids))
-        ]
-        save_cache_to_supabase(language, cache_rows)
-        del docs, cache_rows
+        ])
+        del docs
         gc.collect()
 
-    del chunked_texts, chunked_metadatas, chunked_ids, embeddings
     gc.collect()
     return {"collection": collection, "language": language}
 
@@ -684,7 +655,7 @@ CONFIDENCE_THRESHOLD = 0.45
 def retrieve(collection, query: str, top_k: int = 6):
     expanded  = expand_query(query)
     query_emb = embed_query(expanded)
-    results = collection.query(
+    results   = collection.query(
         query_embeddings=[query_emb],
         n_results=top_k,
         include=["documents", "metadatas", "distances"],
@@ -709,38 +680,41 @@ def get_system_prompt(language: str) -> str:
         return (
             "أنت حورس، مرشد متحف الحضارة المصرية القديمة.\n\n"
             "قواعد ثابتة يجب اتباعها دائماً:\n"
-            "1. أجب فقط من [سياق المتحف] أدناه إن وُجد وكان كافياً.\n"
-            "2. إذا كان السياق غير كافٍ أو فارغاً وتم تزويدك بـ [سياق ويب]:\n"
-            "   - استخدم معلومات [سياق ويب] للإجابة.\n"
-            "   - لا تذكر اسم الموقع في الإجابة — سيظهر الرابط تلقائياً للمستخدم.\n"
-            "3. لا تختلق معلومات أبداً. إذا لم تعرف، قل: 'هذه المعلومة غير متاحة في سجلاتنا.'\n"
-            "4. نطاق عملك: مصر القديمة فقط — فراعنة، آلهة، معالم، أسرات، آثار.\n"
-            "5. للأسئلة خارج النطاق: قل 'أنا متخصص في مصر القديمة فقط. هل تريد استكشاف فرعون أو معلم أو حضارة؟'\n"
-            "6. أولوية اختيار الوثائق:\n"
+            "1. إذا توفر [سياق المتحف]، أجب منه أولاً وبشكل حصري.\n"
+            "2. إذا توفر [سياق ويب]، استخدمه للإجابة ولا تذكر اسم الموقع — سيظهر الرابط تلقائياً.\n"
+            "3. إذا كان السؤال متابعةً لمحادثة سابقة (مثل: 'من أين حصلت على هذه المعلومة؟' أو "
+            "'ماذا قصدت بذلك؟')، أجب بشكل طبيعي بناءً على ما قلته سابقاً في المحادثة.\n"
+            "4. يمكنك الإجابة على أي سؤال يتعلق بمصر القديمة: الحياة اليومية، العادات، الزراعة، "
+            "الطب، الفن، الدين، الأسرات، الفراعنة، المعالم، الآثار — كل ما يخص الحضارة المصرية القديمة.\n"
+            "5. لا تختلق معلومات. إذا كان السؤال خارج نطاق مصر القديمة تماماً، قل: "
+            "'أنا متخصص في مصر القديمة فقط. هل تريد استكشاف فرعون أو معلم أو حضارة؟'\n"
+            "6. أولوية الوثائق:\n"
             "   - سؤال عن شخص/فرعون → وثائق [شخصية تاريخية] أولاً\n"
             "   - سؤال عن مكان/معبد/تمثال → وثائق [معلم أثري] أولاً\n"
             "   - سؤال عن العلاقة بين شخص ومكان → استخدم النوعين\n\n"
             "الأسلوب: دافئ، قصصي، متحمس. اجعل التاريخ حياً. اطرح سؤالاً متابعاً أحياناً.\n"
-            "تحدث بالعربية فقط في جميع ردودك."
+            "تحدث بالعربية فقط."
         )
     return (
         "You are Horus, guide of the Ancient Egyptian Civilization Museum.\n\n"
-        "STRICT RULES — follow without exception:\n"
-        "1. Answer ONLY from the [Museum Context] section when it contains relevant information.\n"
-        "2. If context is empty or insufficient but [Web Context] is provided:\n"
-        "   - Use the [Web Context] to answer the question accurately.\n"
-        "   - Do NOT mention the source site name in your answer — the link will be shown automatically.\n"
-        "3. Never fabricate. If genuinely unknown, say: 'This detail isn't in our records.'\n"
-        "4. Scope: Ancient Egypt only — pharaohs, gods, monuments, dynasties, artifacts.\n"
-        "5. Off-topic questions: say 'I can only guide you through Ancient Egypt! "
-        "What would you like to explore — a pharaoh, a monument, or a dynasty?'\n"
+        "RULES — follow without exception:\n"
+        "1. If [Museum Context] is provided, answer from it first and exclusively.\n"
+        "2. If [Web Context] is provided, use it to answer. Do NOT mention the source site name "
+        "— the link will be shown automatically to the user.\n"
+        "3. If the message is a conversational follow-up (e.g. 'where did you get that?', "
+        "'what did you mean?', 'can you explain more?'), respond naturally based on the "
+        "conversation history — do NOT say 'this detail is not in our records'.\n"
+        "4. You can answer ANY question about Ancient Egypt: daily life, food, farming, "
+        "medicine, art, religion, dynasties, pharaohs, monuments, artifacts, customs, "
+        "architecture — anything related to Ancient Egyptian civilization.\n"
+        "5. Never fabricate. If the question is completely outside Ancient Egypt, say: "
+        "'I can only guide you through Ancient Egypt! What would you like to explore?'\n"
         "6. Document priority:\n"
-        "   - Person/pharaoh question → prioritize [HISTORICAL FIGURE] documents first\n"
-        "   - Place/temple/statue question → prioritize [MONUMENT] documents first\n"
+        "   - Person/pharaoh question → prioritize [HISTORICAL FIGURE] documents\n"
+        "   - Place/temple/statue question → prioritize [MONUMENT] documents\n"
         "   - Relationship between person and place → use both\n\n"
         "Style: Warm, storytelling, enthusiastic. Make history feel alive.\n"
-        "Occasionally ask a follow-up like 'Would you like to know more about this?'\n"
-        "Respond in English only."
+        "Occasionally ask a follow-up question. Respond in English only."
     )
 
 def build_context_block(nodes: list, language: str) -> str:
@@ -748,40 +722,25 @@ def build_context_block(nodes: list, language: str) -> str:
         return ""
     chunks = []
     for i, node in enumerate(nodes, 1):
-        doc_type = node["metadata"].get("type", "document")
-        doc_name = node["metadata"].get("name", "")
-        score    = round(node["score"], 3)
-        if language == "ar":
-            type_label = "شخصية تاريخية" if doc_type == "entity" else "معلم أثري"
-        else:
-            type_label = "HISTORICAL FIGURE" if doc_type == "entity" else "MONUMENT"
-        label = f"[{i}] {type_label}: {doc_name} (score: {score})"
-        chunks.append(f"{label}\n{node['text'].strip()}")
+        doc_type   = node["metadata"].get("type", "document")
+        doc_name   = node["metadata"].get("name", "")
+        score      = round(node["score"], 3)
+        type_label = (
+            ("شخصية تاريخية" if doc_type == "entity" else "معلم أثري")
+            if language == "ar"
+            else ("HISTORICAL FIGURE" if doc_type == "entity" else "MONUMENT")
+        )
+        chunks.append(f"[{i}] {type_label}: {doc_name} (score: {score})\n{node['text'].strip()}")
 
-    sep = "─" * 40
-    if language == "ar":
-        header = "[سياق المتحف — مصدرك الحصري للمعلومات]"
-        footer = "استخدم هذا السياق فقط للإجابة على السؤال التالي."
-    else:
-        header = "[Museum Context — your ONLY allowed information source]"
-        footer = "Use ONLY the above context to answer the question that follows."
-
-    return (
-        f"{header}\n{sep}\n\n"
-        + f"\n\n{sep}\n\n".join(chunks)
-        + f"\n\n{sep}\n{footer}"
-    )
+    sep    = "─" * 40
+    header = "[سياق المتحف — مصدرك الحصري للمعلومات]" if language == "ar" else "[Museum Context — your ONLY allowed information source]"
+    footer = "استخدم هذا السياق فقط للإجابة على السؤال التالي." if language == "ar" else "Use ONLY the above context to answer the question that follows."
+    return f"{header}\n{sep}\n\n" + f"\n\n{sep}\n\n".join(chunks) + f"\n\n{sep}\n{footer}"
 
 def build_web_context_block(page_content: str, language: str) -> str:
-    """Build a context block from fetched web page content."""
-    sep = "─" * 40
-    if language == "ar":
-        header = "[سياق ويب — معلومات من مصدر موثوق]"
-        footer = "استخدم هذا السياق للإجابة على السؤال التالي."
-    else:
-        header = "[Web Context — information from a trusted historical source]"
-        footer = "Use the above web context to answer the question that follows."
-
+    sep    = "─" * 40
+    header = "[سياق ويب — معلومات من مصدر موثوق]" if language == "ar" else "[Web Context — information from a trusted historical source]"
+    footer = "استخدم هذا السياق للإجابة على السؤال التالي." if language == "ar" else "Use the above web context to answer the question that follows."
     return f"{header}\n{sep}\n\n{page_content.strip()}\n\n{sep}\n{footer}"
 
 
@@ -802,9 +761,7 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
     for turn in (history or []):
         role = turn.get("role", "user")
         msg  = turn.get("content", "").strip()
-        if not msg:
-            continue
-        if role == last_role:
+        if not msg or role == last_role:
             continue
         contents.append({"role": role, "parts": [{"text": msg}]})
         last_role = role
@@ -814,18 +771,35 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
     else:
         contents.append({"role": "user", "parts": [{"text": prompt}]})
 
-    body = {
-        "contents": contents,
-        "generationConfig": {"temperature": 0.1},
-    }
+    body = {"contents": contents, "generationConfig": {"temperature": 0.1}}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
 
-    resp = requests.post(GEMINI_CHAT_URL, params=params, headers=headers, json=body)
-    if not resp.ok:
-        print(f"❌ Gemini error {resp.status_code}: {resp.text[:300]}")
-    resp.raise_for_status()
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    # Retry on 503 (overloaded) and 429 (rate limit) — both are transient
+    max_retries  = 4
+    wait_seconds = [3, 6, 12, 20]
+    resp = None
+
+    for attempt in range(max_retries):
+        resp = requests.post(GEMINI_CHAT_URL, params=params, headers=headers, json=body)
+
+        if resp.status_code in (429, 503):
+            wait = wait_seconds[attempt]
+            print(f"⏳ Gemini {resp.status_code} on attempt {attempt + 1} — retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+
+        if not resp.ok:
+            print(f"❌ Gemini error {resp.status_code}: {resp.text[:300]}")
+
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    # All retries exhausted
+    raise requests.exceptions.HTTPError(
+        f"Gemini unavailable after {max_retries} retries",
+        response=resp
+    )
 
 
 # =============================
@@ -835,84 +809,69 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     collection = engine["collection"]
     language   = engine["language"]
 
-    # ── Step 1: Try RAG first ─────────────────────────────────────────────────
+    system_prompt  = get_system_prompt(language)
+    recent_history = history[-12:] if len(history) > 12 else history
+    gemini_history = [
+        {"role": "user" if t.get("role") == "user" else "model", "content": t.get("content", "")}
+        for t in recent_history
+        if t.get("role") in ("user", "assistant") and t.get("content", "")
+    ]
+
+    # ── Step 1: Greetings — respond directly, no RAG or web search needed ─────
+    if is_greeting(message):
+        print(f"👋 Greeting detected — responding directly")
+        return gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
+
+    # ── Step 2: Conversational follow-ups — answer from history, skip RAG ─────
+    if is_conversational(message):
+        print(f"💬 Follow-up detected — answering from conversation history")
+        return gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
+
+    # ── Step 3: Try RAG on the factual question ───────────────────────────────
     nodes         = retrieve(collection, message)
     context_block = build_context_block(nodes, language)
 
-    system_prompt  = get_system_prompt(language)
-    recent_history = history[-12:] if len(history) > 12 else history
-    gemini_history = []
-    for turn in recent_history:
-        r   = turn.get("role", "user")
-        msg = turn.get("content", "")
-        if r in ("user", "assistant") and msg:
-            gemini_history.append({
-                "role":    "user" if r == "user" else "model",
-                "content": msg,
-            })
-
-    # ── Step 2: RAG has enough context → answer directly ─────────────────────
     if context_block:
+        print(f"✅ RAG hit — answering from museum data")
         augmented = f"{context_block}\n\nQuestion: {message}"
-        answer    = gemini_generate(
-            prompt=augmented,
-            system=system_prompt,
-            history=gemini_history,
-        )
-        return answer
+        return gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
 
-    # ── Step 3: RAG found nothing → use real web search as fallback ───────────
-    print(f"📭 RAG miss for: '{message}' — triggering web search fallback")
-
-    # Build a clean English search query even for Arabic questions
-    # so that search results are in English (better coverage on these sites)
+    # ── Step 4: RAG missed → try trusted web sources ──────────────────────────
+    print(f"📭 RAG miss for: '{message}' — trying web search")
     search_query = f"Ancient Egypt {message}"
-
-    web_result = web_search_and_ground(search_query, language)
+    web_result   = web_search_and_ground(search_query)
 
     if web_result:
-        # Ground Gemini on the real fetched page content
+        print(f"🌐 Web hit: {web_result['url']}")
         web_context = build_web_context_block(web_result["page_content"], language)
         augmented   = f"{web_context}\n\nQuestion: {message}"
+        answer      = gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
 
-        answer = gemini_generate(
-            prompt=augmented,
-            system=system_prompt,
-            history=gemini_history,
-        )
-
-        # Append the real source link — this is the exact article page, not a search page
-        url         = web_result["url"]
-        source_name = web_result["source_name"]
-        title       = web_result["title"]
-
+        # Append the real article link — not a search page
+        url   = web_result["url"]
+        title = web_result["title"]
         if language == "ar":
             answer += f"\n\n📖 المصدر: [{title}]({url})"
         else:
             answer += f"\n\n📖 Source: [{title}]({url})"
+        return answer
 
+    # ── Step 5: Nothing found anywhere — answer from Gemini knowledge + disclaimer ──
+    print("No results from RAG or web — answering from Gemini knowledge with disclaimer")
+    answer = gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
+    if language == "ar":
+        answer += "\n\n---\n"
+        answer += "⚠️ *تنبيه: هذه المعلومات مستندة إلى المعرفة العامة لحورس، وليست من بياناتنا المتحفية أو مصادرنا الموثوقة المعتمدة.*"
     else:
-        # Web search unavailable or returned nothing — answer from Gemini training only
-        # with a clear disclaimer (no fake links)
-        print("⚠️ Web search returned no results — answering from Gemini training data only")
-        augmented = message
-        answer    = gemini_generate(
-            prompt=augmented,
-            system=system_prompt,
-            history=gemini_history,
-        )
-        if language == "ar":
-            answer += "\n\n📜 *هذه المعلومة مستندة إلى المعرفة العامة ولم يُتحقق منها من مصدر موثوق.*"
-        else:
-            answer += "\n\n📜 *This answer is based on general knowledge and has not been verified from a trusted source.*"
-
+        answer += "\n\n---\n"
+        answer += "⚠️ *Note: This answer is based on Horus's general knowledge and has not been sourced from our museum database or trusted historical references.*"
     return answer
 
 
 # =============================
 # 🚀 FastAPI App
 # =============================
-app      = FastAPI()
+app          = FastAPI()
 _engines: dict = {}
 _engine_lock   = threading.Lock()
 
@@ -944,11 +903,12 @@ threading.Thread(target=build_engines_sequentially, daemon=True).start()
 # =============================
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
+    cse_ok = bool(GOOGLE_CSE_KEY and GOOGLE_CSE_ID)
     return {
-        "status":      "ok",
-        "en_engine":   "ready" if "en" in _engines else "building...",
-        "ar_engine":   "ready" if "ar" in _engines else "building...",
-        "web_search":  "enabled" if (GOOGLE_CSE_KEY and GOOGLE_CSE_ID) else "disabled (set GOOGLE_CSE_KEY + GOOGLE_CSE_ID)",
+        "status":     "ok",
+        "en_engine":  "ready" if "en" in _engines else "building...",
+        "ar_engine":  "ready" if "ar" in _engines else "building...",
+        "web_search": "enabled" if cse_ok else "disabled — set GOOGLE_CSE_KEY + GOOGLE_CSE_ID",
     }
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -957,7 +917,6 @@ def home():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    # ✅ Pass is_vip from the request — no Supabase re-fetch needed
     limit_message = check_usage_limit(request.user_id, request.language, request.is_vip)
     if limit_message:
         return {"answer": limit_message}
@@ -965,46 +924,31 @@ def chat(request: ChatRequest):
     try:
         engine = get_engine(request.language)
         answer = run_chat(engine, request.message, request.history)
-
-        # ✅ Only increment usage for non-VIP logged-in users
         if request.user_id and not request.is_vip:
             increment_usage(request.user_id)
-
         return {"answer": answer}
 
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"❌ Gemini HTTP error: {status} — {e}")
         return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
-
     except Exception as e:
         print(f"❌ Chat error: {e}")
         return {"answer": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"])}
 
 @app.post("/generate-quiz")
 def generate_quiz(request: QuizRequest):
-    # ✅ Pass is_vip from the request — same fix as /chat
     limit_message = check_usage_limit(request.user_id, request.language, request.is_vip)
     if limit_message:
-        return {"quiz": [{
-            "question": limit_message,
-            "options": ["OK", "OK", "OK", "OK"],
-            "correct_answer": "OK",
-        }]}
+        return {"quiz": [{"question": limit_message, "options": ["OK","OK","OK","OK"], "correct_answer": "OK"}]}
 
     try:
-        history_text = (
-            "\n".join(request.chat_history)
-            if request.chat_history
-            else "General Ancient Egyptian history, pharaohs, and monuments"
-        )
-
+        history_text     = "\n".join(request.chat_history) if request.chat_history else "General Ancient Egyptian history, pharaohs, and monuments"
         lang_instruction = (
             "CRITICAL: Generate ALL questions, options, and answers in Arabic only."
             if request.language == "ar"
             else "Generate all questions and answers in English."
         )
-
         quiz_prompt = f"""Based on this conversation about Ancient Egypt:
 {history_text}
 
@@ -1026,36 +970,23 @@ Example format:
 
         raw  = gemini_generate(quiz_prompt).strip().replace("```json", "").replace("```", "").strip()
         quiz = json_lib.loads(raw)
-
-        # ✅ Only increment for non-VIP logged-in users
         if request.user_id and not request.is_vip:
             increment_usage(request.user_id)
-
         return {"quiz": quiz}
 
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         print(f"❌ Gemini HTTP error (quiz): {status} — {e}")
-        return {"quiz": [{
-            "question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]),
-            "options": ["OK", "OK", "OK", "OK"],
-            "correct_answer": "OK",
-        }]}
-
+        return {"quiz": [{"question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]), "options": ["OK","OK","OK","OK"], "correct_answer": "OK"}]}
     except Exception as e:
         print(f"❌ Quiz error: {e}")
-        return {"quiz": [{
-            "question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]),
-            "options": ["OK", "OK", "OK", "OK"],
-            "correct_answer": "OK",
-        }]}
+        return {"quiz": [{"question": SERVICE_BUSY_MESSAGE.get(request.language, SERVICE_BUSY_MESSAGE["en"]), "options": ["OK","OK","OK","OK"], "correct_answer": "OK"}]}
 
 @app.api_route("/rebuild-index", methods=["GET", "POST"])
 def rebuild_index(background_tasks: BackgroundTasks):
     global _engines
     if getattr(app.state, "rebuilding", False):
         return {"error": "Rebuild already in progress."}
-
     app.state.rebuilding = True
     _engines = {}
     gc.collect()
@@ -1072,7 +1003,7 @@ def rebuild_index(background_tasks: BackgroundTasks):
             app.state.rebuilding = False
 
     background_tasks.add_task(do_rebuild)
-    return {"message": "Rebuild started. Cache cleared, re-embedding from scratch.", "status": "rebuilding"}
+    return {"message": "Rebuild started.", "status": "rebuilding"}
 
 @app.api_route("/rebuild-status", methods=["GET"])
 def rebuild_status():
@@ -1088,17 +1019,11 @@ def debug_retrieve(q: str = "Ramses II", lang: str = "en"):
     try:
         engine  = get_engine(lang)
         nodes   = retrieve(engine["collection"], q)
-        results = [
-            {
-                "rank":    i + 1,
-                "score":   node["score"],
-                "type":    node["metadata"].get("type"),
-                "name":    node["metadata"].get("name"),
-                "preview": node["text"][:300],
-            }
-            for i, node in enumerate(nodes)
-        ]
-        return {"query": q, "language": lang, "results": results}
+        return {"query": q, "language": lang, "results": [
+            {"rank": i+1, "score": n["score"], "type": n["metadata"].get("type"),
+             "name": n["metadata"].get("name"), "preview": n["text"][:300]}
+            for i, n in enumerate(nodes)
+        ]}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1119,21 +1044,28 @@ def debug_entity(name: str = "Ramesses II"):
     except Exception as e:
         return {"error": str(e)}
 
-# ── New: debug web search so you can test it without going through chat ───────
 @app.api_route("/debug-websearch", methods=["GET"])
-def debug_websearch(q: str = "Imhotep architect", lang: str = "en"):
+def debug_websearch(q: str = "Imhotep architect"):
     """
-    Test the web search fallback independently.
-    Call: GET /debug-websearch?q=Imhotep+architect&lang=en
+    ✅ Use this to verify Google CSE is working correctly.
+    Call: GET /debug-websearch?q=Imhotep+architect
+    A working response shows a real URL from one of your trusted domains.
+    If web_search is disabled, check GOOGLE_CSE_KEY and GOOGLE_CSE_ID env vars.
     """
-    result = web_search_and_ground(f"Ancient Egypt {q}", lang)
+    result = web_search_and_ground(f"Ancient Egypt {q}")
     if not result:
-        return {"error": "No results found or web search not configured"}
+        cse_configured = bool(GOOGLE_CSE_KEY and GOOGLE_CSE_ID)
+        return {
+            "error":       "No results found",
+            "cse_configured": cse_configured,
+            "hint": "Check GOOGLE_CSE_KEY and GOOGLE_CSE_ID env vars on Railway" if not cse_configured else "CSE is configured but returned no results for this query",
+        }
     return {
-        "url":             result["url"],
-        "title":           result["title"],
-        "source_name":     result["source_name"],
-        "page_content":    result["page_content"][:500] + "...",
+        "status":       "✅ Web search working",
+        "url":          result["url"],
+        "title":        result["title"],
+        "source_name":  result["source_name"],
+        "page_content": result["page_content"][:500] + "...",
     }
 
 if __name__ == "__main__":
