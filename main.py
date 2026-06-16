@@ -23,8 +23,7 @@ import requests
 SUPABASE_URL   = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY   = os.environ.get("SUPABASE_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GOOGLE_CSE_KEY = os.environ.get("GOOGLE_CSE_KEY")
-GOOGLE_CSE_ID  = os.environ.get("GOOGLE_CSE_ID")
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
     raise ValueError(
@@ -85,44 +84,42 @@ TRUSTED_SOURCES = [
     },
 ]
 
-# Domains used to restrict the Google Custom Search Engine.
-# NOTE: louvre.fr/en → louvre.fr (CSE matches by domain, not path)
+# FIX:
+# NOTE: louvre.fr/en → louvre.fr (SerpAPI site: filter matches by domain, not path)
 TRUSTED_DOMAINS = [s["url"].replace("https://", "") for s in TRUSTED_SOURCES]
-
 # =============================
 # 🔎 Google Custom Search
 # =============================
-GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
-
+SERPAPI_ENDPOINT = "https://serpapi.com/search"
 
 def web_search_trusted(query: str, num_results: int = 3) -> list[dict]:
-    """
-    Search trusted Egyptology sites via Google Custom Search API.
-    Returns a list of {title, url, snippet} dicts, or [] on any failure.
-    """
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_ID:
-        print("⚠️ GOOGLE_CSE_KEY or GOOGLE_CSE_ID not set — web search disabled")
+    if not SERPAPI_KEY:
+        print("⚠️ SERPAPI_KEY not set — web search disabled")
         return []
+
+    # Restrict search to your trusted domains only
+    site_filter = " OR ".join(f"site:{domain}" for domain in TRUSTED_DOMAINS)
+    restricted_query = f"{query} ({site_filter})"
 
     try:
         params = {
-            "key": GOOGLE_CSE_KEY,
-            "cx":  GOOGLE_CSE_ID,
-            "q":   query,
-            "num": num_results,
+            "api_key": SERPAPI_KEY,
+            "engine":  "google",
+            "q":       restricted_query,
+            "num":     num_results,
         }
-        resp = requests.get(GOOGLE_CSE_ENDPOINT, params=params, timeout=8)
+        resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=10)
         resp.raise_for_status()
-        items = resp.json().get("items", [])
+        items = resp.json().get("organic_results", [])
         results = [
             {
                 "title":   item.get("title", ""),
                 "url":     item.get("link", ""),
                 "snippet": item.get("snippet", ""),
             }
-            for item in items
+            for item in items[:num_results]
         ]
-        print(f"🔍 Web search '{query}' → {len(results)} results")
+        print(f"🔍 SerpAPI search '{query}' → {len(results)} results")
         return results
     except Exception as e:
         print(f"⚠️ Web search failed: {e}")
@@ -903,12 +900,11 @@ threading.Thread(target=build_engines_sequentially, daemon=True).start()
 # =============================
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    cse_ok = bool(GOOGLE_CSE_KEY and GOOGLE_CSE_ID)
     return {
         "status":     "ok",
         "en_engine":  "ready" if "en" in _engines else "building...",
         "ar_engine":  "ready" if "ar" in _engines else "building...",
-        "web_search": "enabled" if cse_ok else "disabled — set GOOGLE_CSE_KEY + GOOGLE_CSE_ID",
+        "web_search": "enabled" if SERPAPI_KEY else "disabled — set SERPAPI_KEY",
     }
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -1047,18 +1043,18 @@ def debug_entity(name: str = "Ramesses II"):
 @app.api_route("/debug-websearch", methods=["GET"])
 def debug_websearch(q: str = "Imhotep architect"):
     """
-    ✅ Use this to verify Google CSE is working correctly.
+    ✅ Use this to verify SerpAPI is working correctly.
     Call: GET /debug-websearch?q=Imhotep+architect
     A working response shows a real URL from one of your trusted domains.
-    If web_search is disabled, check GOOGLE_CSE_KEY and GOOGLE_CSE_ID env vars.
+    If web_search is disabled, check SERPAPI_KEY env var.
     """
     result = web_search_and_ground(f"Ancient Egypt {q}")
     if not result:
-        cse_configured = bool(GOOGLE_CSE_KEY and GOOGLE_CSE_ID)
+        serpapi_configured = bool(SERPAPI_KEY)
         return {
-            "error":       "No results found",
-            "cse_configured": cse_configured,
-            "hint": "Check GOOGLE_CSE_KEY and GOOGLE_CSE_ID env vars on Railway" if not cse_configured else "CSE is configured but returned no results for this query",
+            "error":              "No results found",
+            "serpapi_configured": serpapi_configured,
+            "hint": "Check SERPAPI_KEY env var on Railway" if not serpapi_configured else "SerpAPI is configured but returned no results for this query",
         }
     return {
         "status":       "✅ Web search working",
