@@ -806,6 +806,25 @@ def gemini_generate(prompt: str, system: str = "", history: list = None) -> str:
 TOP_SCORE_THRESHOLD = 0.70
 
 # =============================
+# detect arabic translation
+# =============================
+def build_search_query(message: str) -> str:
+    """If message contains Arabic, ask Gemini to extract the English topic for search."""
+    if re.search(r'[\u0600-\u06FF]', message):
+        try:
+            translated = gemini_generate(
+                prompt=(
+                    f"Extract the main historical topic from this Arabic question and "
+                    f"return ONLY a short English search phrase (3-6 words), nothing else: {message}"
+                )
+            ).strip()
+            print(f"🌐 Arabic query translated for search: '{translated}'")
+            return f"Ancient Egypt {translated}"
+        except Exception as e:
+            print(f"⚠️ Translation failed, using original: {e}")
+    return f"Ancient Egypt {message}"
+
+# =============================
 # 💬 Chat Logic
 # =============================
 def run_chat(engine: dict, message: str, history: List[dict]) -> str:
@@ -838,7 +857,13 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
     if context_block and top_score >= TOP_SCORE_THRESHOLD:
         print(f"✅ RAG high confidence (score {top_score:.3f}) — answering from museum data")
         augmented = f"{context_block}\n\nQuestion: {message}"
-        return gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
+        answer = gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
+        museum_note = (
+            "\n\n---\n🏛️ *استناداً إلى سجلات متحفناالموثوقة.*"
+            if language == "ar"
+            else "\n\n---\n🏛️ *Based on our trusted museum records.*"
+        )
+        return answer + museum_note
 
     if context_block:
         print(f"⚠️ RAG low confidence (score {top_score:.3f}) — trying web search first")
@@ -846,7 +871,7 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
         print(f"📭 RAG miss — trying web search for: '{message}'")
 
     # ── Step 4: Web search ────────────────────────────────────────────────────
-    search_query = f"Ancient Egypt {message}"
+    search_query = build_search_query(message)
     web_result   = web_search_and_ground(search_query)
 
     if web_result:
@@ -858,28 +883,19 @@ def run_chat(engine: dict, message: str, history: List[dict]) -> str:
         url   = web_result["url"]
         title = web_result["title"]
         if language == "ar":
-            answer += f"\n\n📖 المصدر: [{title}]({url})"
+            answer += f"\n\n---\n🌐 *استناداً إلى مصادر تاريخية موثوقة.* 📖 [{title}]({url})"
         else:
-            answer += f"\n\n📖 Source: [{title}]({url})"
-        return answer
+            answer += f"\n\n---\n🌐 *Based on trusted historical sources.* 📖 [{title}]({url})"
 
-    # ── Step 5: Web missed — fall back to low-confidence RAG ─────────────────
-    if context_block:
-        print(f"🔄 Web miss — falling back to RAG result (score {top_score:.3f})")
-        augmented = f"{context_block}\n\nQuestion: {message}"
-        return gemini_generate(prompt=augmented, system=system_prompt, history=gemini_history)
-
-    # ── Step 6: Nothing found — Gemini knowledge + disclaimer ─────────────────
-    print("No results from RAG or web — answering from Gemini knowledge with disclaimer")
+    # ── Step 5: Nothing found (web miss or no RAG) — Gemini general knowledge ──
+    print("🔄 No confident source found — answering from Gemini general knowledge")
     answer = gemini_generate(prompt=message, system=system_prompt, history=gemini_history)
-    if language == "ar":
-        answer += "\n\n---\n"
-        answer += "⚠️ *تنبيه: هذه المعلومات مستندة إلى المعرفة العامة لحورس، وليست من بياناتنا المتحفية أو مصادرنا الموثوقة المعتمدة.*"
-    else:
-        answer += "\n\n---\n"
-        answer += "⚠️ *Note: This answer is based on Horus's general knowledge and has not been sourced from our museum database or trusted historical references.*"
-    return answer
-
+    knowledge_note = (
+        "\n\n---\n📚 *استناداً إلى المعرفة التاريخية العامة.*"
+        if language == "ar"
+        else "\n\n---\n📚 *Based on general historical knowledge.*"
+    )
+    return answer + knowledge_note
 # =============================
 # 🚀 FastAPI App
 # =============================
